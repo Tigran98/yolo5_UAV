@@ -1,0 +1,6 @@
+names:
+  0: drone
+path: ..\yolov8_nano_ssd\data\anti-uav
+train: images/train
+val: images/val
+test: images/test-2
