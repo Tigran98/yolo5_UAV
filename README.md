@@ -9,7 +9,7 @@
   <a href="https://github.com/Tigran98/yolo5_UAV/stargazers"><img src="https://img.shields.io/github/stars/Tigran98/yolo5_UAV" alt="GitHub stars"></a>
   <a href="https://github.com/Tigran98/yolo5_UAV/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Tigran98/yolo5_UAV" alt="License"></a>
 
-</div>
+  </div>
 
 # 🚁 YOLOv5 UAV Detection System
 
@@ -33,12 +33,31 @@ This repository contains a **YOLOv5-based UAV (Unmanned Aerial Vehicle) detectio
 
 ## 📊 Performance Benchmarks
 
-| Model | Dataset | mAP@0.5 | mAP@0.5:0.95 | FPS (Jetson Xavier) | FPS (FPGA) |
-|-------|---------|---------|--------------|---------------------|------------|
-| YOLOv5n | Full | TBD | TBD | ~45 | ~30 |
-| YOLOv5s | Full | TBD | TBD | ~35 | ~25 |
-| YOLOv5n | IR | TBD | TBD | ~45 | ~30 |
-| YOLOv5s | RGB | TBD | TBD | ~35 | ~25 |
+### Training Results (100 epochs, batch size 64, image size 640)
+
+| Model | Dataset | Precision | Recall | mAP@0.5 (Best) | mAP@0.5:0.95 (Best) | Parameters | Model Size |
+|-------|---------|-----------|--------|----------------|---------------------|------------|------------|
+| YOLOv5n | Full (RGB+IR) | 95.1% | 79.5% | **91.21%** | **46.76%** | 1.9M | 3.9 MB |
+| YOLOv5n | IR Only | 97.9% | 86.8% | **94.89%** | **51.01%** | 1.9M | 3.9 MB |
+| YOLOv5n | RGB Only | 96.8% | 66.8% | **85.62%** | **42.89%** | 1.9M | 3.9 MB |
+
+**Key Observations:**
+- **IR-only model** achieves the best performance with 94.89% mAP@0.5 and 51.01% mAP@0.5:0.95
+- **Full dataset (RGB+IR)** shows balanced performance with 91.21% mAP@0.5
+- **RGB-only model** has lower recall (66.8%), suggesting drones are harder to detect in RGB images
+- All models trained for 100 epochs with SGD optimizer
+
+### Inference Performance (Estimated)
+
+| Platform | Model | Precision | FPS | Power |
+|----------|-------|-----------|-----|-------|
+| NVIDIA Jetson Xavier NX | YOLOv5n FP16 | FP16 | ~45 | 15W |
+| NVIDIA Jetson Xavier NX | YOLOv5n INT8 | INT8 | ~60 | 15W |
+| NVIDIA Jetson Orin Nano | YOLOv5n FP16 | FP16 | ~70 | 15W |
+| Xilinx Kria KV260 | YOLOv5n INT8 | INT8 | ~30 | 10W |
+| Desktop GPU (RTX 3080) | YOLOv5n FP32 | FP32 | ~200 | 320W |
+
+*Note: FPS values are estimates and may vary based on actual implementation and optimization.*
 
 <div align="center">
   <img src="runs/exp_FULL/results.png" width="80%" alt="Training Results">
@@ -936,39 +955,169 @@ python3 deploy_fpga.py
 
 ### Training Results
 
-<div align="center">
-  <img src="runs/exp_FULL/results.png" width="90%" alt="Training Curves">
-  <p><i>Training metrics over 100 epochs</i></p>
-</div>
+#### Detailed Performance Comparison
 
-### Confusion Matrix
+| Experiment | Model | Best Epoch | Final mAP@0.5 | Final mAP@0.5:0.95 | Training Time (100 epochs) |
+|------------|-------|------------|---------------|--------------------|-----------------------------|
+| exp_FULL | YOLOv5n | 10-12 | 85.83% | 40.97% | ~8 hours (estimated) |
+| exp_IR | YOLOv5n | 8-13 | 92.30% | 47.13% | ~8 hours (estimated) |
+| exp_RGB | YOLOv5n | 15-34 | 76.63% | 36.67% | ~8 hours (estimated) |
 
-<div align="center">
-  <img src="runs/exp_FULL/confusion_matrix.png" width="50%" alt="Confusion Matrix">
-</div>
-
-### Sample Detections
+**Performance Analysis:**
+- 🥇 **IR model converges fastest** (best results at epoch 8-13)
+- 🥈 **Full model (RGB+IR)** shows good generalization
+- 🥉 **RGB model** requires more epochs and achieves lower accuracy
 
 <div align="center">
   <table>
     <tr>
-      <td><img src="runs/exp_FULL/val_batch0_pred.jpg" width="100%" alt="Detection Sample 1"></td>
-      <td><img src="runs/exp_FULL/val_batch1_pred.jpg" width="100%" alt="Detection Sample 2"></td>
+      <td align="center"><b>Full Dataset (RGB+IR)</b></td>
+      <td align="center"><b>IR Only</b></td>
+      <td align="center"><b>RGB Only</b></td>
     </tr>
     <tr>
-      <td><img src="runs/exp_FULL/val_batch2_pred.jpg" width="100%" alt="Detection Sample 3"></td>
-      <td><img src="runs/exp_IR/val_batch0_pred.jpg" width="100%" alt="IR Detection Sample"></td>
+      <td><img src="runs/exp_FULL/results.png" width="100%" alt="Full Training Results"></td>
+      <td><img src="runs/exp_IR/results.png" width="100%" alt="IR Training Results"></td>
+      <td><img src="runs/exp_RGB/results.png" width="100%" alt="RGB Training Results"></td>
     </tr>
   </table>
-  <p><i>UAV detection results on validation set (RGB and IR)</i></p>
+  <p><i>Training metrics comparison: Precision, Recall, mAP curves for all three experiments</i></p>
+</div>
+
+### Confusion Matrices
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><b>Full Dataset</b></td>
+      <td align="center"><b>IR Only</b></td>
+      <td align="center"><b>RGB Only</b></td>
+    </tr>
+    <tr>
+      <td><img src="runs/exp_FULL/confusion_matrix.png" width="100%" alt="Full Confusion Matrix"></td>
+      <td><img src="runs/exp_IR/confusion_matrix.png" width="100%" alt="IR Confusion Matrix"></td>
+      <td><img src="runs/exp_RGB/confusion_matrix.png" width="100%" alt="RGB Confusion Matrix"></td>
+    </tr>
+  </table>
+  <p><i>Confusion matrices showing detection performance across different datasets</i></p>
+</div>
+
+### Sample Detections
+
+#### Full Dataset (RGB+IR) Predictions
+<div align="center">
+  <table>
+    <tr>
+      <td><img src="runs/exp_FULL/val_batch0_pred.jpg" width="100%" alt="Full Dataset - Batch 0"></td>
+      <td><img src="runs/exp_FULL/val_batch1_pred.jpg" width="100%" alt="Full Dataset - Batch 1"></td>
+      <td><img src="runs/exp_FULL/val_batch2_pred.jpg" width="100%" alt="Full Dataset - Batch 2"></td>
+    </tr>
+  </table>
+</div>
+
+#### IR-Only Dataset Predictions
+<div align="center">
+  <table>
+    <tr>
+      <td><img src="runs/exp_IR/val_batch0_pred.jpg" width="100%" alt="IR Dataset - Batch 0"></td>
+      <td><img src="runs/exp_IR/val_batch1_pred.jpg" width="100%" alt="IR Dataset - Batch 1"></td>
+      <td><img src="runs/exp_IR/val_batch2_pred.jpg" width="100%" alt="IR Dataset - Batch 2"></td>
+    </tr>
+  </table>
+</div>
+
+#### RGB-Only Dataset Predictions
+<div align="center">
+  <table>
+    <tr>
+      <td><img src="runs/exp_RGB/val_batch0_pred.jpg" width="100%" alt="RGB Dataset - Batch 0"></td>
+      <td><img src="runs/exp_RGB/val_batch1_pred.jpg" width="100%" alt="RGB Dataset - Batch 1"></td>
+      <td><img src="runs/exp_RGB/val_batch2_pred.jpg" width="100%" alt="RGB Dataset - Batch 2"></td>
+    </tr>
+  </table>
+  <p><i>UAV detection results on validation sets across all three experiments</i></p>
+</div>
+
+### Precision-Recall Curves
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><b>Full Dataset</b></td>
+      <td align="center"><b>IR Only</b></td>
+      <td align="center"><b>RGB Only</b></td>
+    </tr>
+    <tr>
+      <td><img src="runs/exp_FULL/PR_curve.png" width="100%" alt="Full PR Curve"></td>
+      <td><img src="runs/exp_IR/PR_curve.png" width="100%" alt="IR PR Curve"></td>
+      <td><img src="runs/exp_RGB/PR_curve.png" width="100%" alt="RGB PR Curve"></td>
+    </tr>
+    <tr>
+      <td align="center"><b>F1 Score - Full</b></td>
+      <td align="center"><b>F1 Score - IR</b></td>
+      <td align="center"><b>F1 Score - RGB</b></td>
+    </tr>
+    <tr>
+      <td><img src="runs/exp_FULL/F1_curve.png" width="100%" alt="Full F1 Curve"></td>
+      <td><img src="runs/exp_IR/F1_curve.png" width="100%" alt="IR F1 Curve"></td>
+      <td><img src="runs/exp_RGB/F1_curve.png" width="100%" alt="RGB F1 Curve"></td>
+    </tr>
+  </table>
+  <p><i>Precision-Recall and F1 curves showing model performance at different confidence thresholds</i></p>
 </div>
 
 ### Label Statistics
 
 <div align="center">
-  <img src="runs/exp_FULL/labels.jpg" width="70%" alt="Label Statistics">
-  <p><i>Dataset label distribution</i></p>
+  <table>
+    <tr>
+      <td><img src="runs/exp_FULL/labels.jpg" width="100%" alt="Full Dataset Labels"></td>
+      <td><img src="runs/exp_IR/labels.jpg" width="100%" alt="IR Dataset Labels"></td>
+    </tr>
+  </table>
+  <p><i>Dataset label distribution and bounding box statistics</i></p>
 </div>
+
+---
+
+## 📈 Experiment Summary & Insights
+
+### Key Findings
+
+1. **IR Images Perform Best** 🥇
+   - Highest mAP@0.5: 94.89%
+   - Highest mAP@0.5:0.95: 51.01%
+   - Best precision (97.9%) and recall (86.8%)
+   - Fastest convergence (best results at epoch 8)
+
+2. **Combined Dataset (RGB+IR) Shows Balance** 🥈
+   - Good generalization: mAP@0.5 = 91.21%
+   - Balanced between RGB and IR performance
+   - Suitable for mixed deployment scenarios
+
+3. **RGB-Only Challenges** 🥉
+   - Lowest recall: 66.8% (many missed detections)
+   - Lower mAP@0.5: 85.62% (best epoch), 76.63% (final)
+   - Drones harder to detect against complex backgrounds
+   - Requires longer training (best at epochs 15-34)
+
+### Recommendations
+
+| Use Case | Recommended Model | Reason |
+|----------|-------------------|---------|
+| Infrared/Thermal Cameras | **exp_IR** model | Best accuracy (94.89% mAP), highest recall |
+| RGB Day/Night Mixed | **exp_FULL** model | Balanced performance, handles both modalities |
+| RGB Only (Daylight) | **exp_RGB** model | Optimized for visible spectrum |
+| Real-time Edge Deployment | **exp_IR** with INT8 | Best accuracy + fastest inference |
+| Multi-sensor Fusion | **Ensemble (IR+RGB)** | Complementary strengths |
+
+### Training Insights
+
+- **Early Stopping**: IR model peaks at epoch 8-13, Full at 10-12, RGB at 15-34
+- **Batch Size**: All experiments used batch size 64 for stability
+- **Image Size**: 640x640 provides good balance between accuracy and speed
+- **Optimizer**: SGD with momentum (0.937) works well
+- **Data Augmentation**: Standard augmentations (mosaic, flip, scale) applied
 
 ---
 
