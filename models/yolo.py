@@ -44,6 +44,7 @@ from models.common import (
     DWConv,
     DWConvTranspose2d,
     Expand,
+    FeatureFusion,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -229,6 +230,16 @@ class DetectionModel(BaseModel):
             self.yaml_file = Path(cfg).name
             with open(cfg, encoding="ascii", errors="ignore") as f:
                 self.yaml = yaml.safe_load(f)  # model dict
+        
+        # Check if this is a fusion model config
+        if self.yaml.get("fusion_indices") is not None or "fusion" in str(cfg).lower():
+            # Import and return FusionModel instead
+            from models.fusion_model import FusionModel
+            raise RuntimeError(
+                "Fusion model detected. Use FusionModel instead of Model:\n"
+                "  from models.fusion_model import FusionModel\n"
+                f"  model = FusionModel('{cfg}', ch={ch}, nc={nc})"
+            )
 
         # Define model
         ch = self.yaml["ch"] = self.yaml.get("ch", ch)  # input channels

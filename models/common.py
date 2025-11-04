@@ -1121,3 +1121,33 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+
+class FeatureFusion(nn.Module):
+    """Fuses RGB and IR features using concatenation + 1x1 convolution."""
+
+    def __init__(self, c1):
+        """
+        Initializes feature fusion module.
+        
+        Args:
+            c1: Input channels from each modality (output channels will be same)
+        """
+        super().__init__()
+        # Concatenate features and reduce back to original channels with 1x1 conv
+        self.fuse = Conv(c1 * 2, c1, k=1, s=1)
+    
+    def forward(self, x_rgb, x_ir):
+        """
+        Fuses RGB and IR features.
+        
+        Args:
+            x_rgb: RGB features (B, C, H, W)
+            x_ir: IR features (B, C, H, W)
+            
+        Returns:
+            Fused features (B, C, H, W)
+        """
+        # Concatenate along channel dimension and apply 1x1 conv
+        x = torch.cat([x_rgb, x_ir], dim=1)
+        return self.fuse(x)
