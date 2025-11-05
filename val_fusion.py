@@ -359,7 +359,9 @@ def run(
         for si, pred in enumerate(preds):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path, shape = Path(paths[si]), shapes[si][0]
+            # Handle paths: fusion model returns tuple (rgb_path, ir_path), standard model returns string
+            path_str = paths[si][0] if isinstance(paths[si], (tuple, list)) else paths[si]
+            path, shape = Path(path_str), shapes[si][0]
             correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
 

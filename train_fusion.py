@@ -65,6 +65,7 @@ from utils.general import (
     check_img_size,
     check_requirements,
     check_suffix,
+    check_version,
     check_yaml,
     colorstr,
     get_latest_run,
@@ -470,7 +471,12 @@ def train(hyp, opt, device, callbacks):
                     ir_imgs = nn.functional.interpolate(ir_imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            # Use torch.amp.autocast for PyTorch >= 1.10.0, otherwise use torch.cuda.amp.autocast
+            if check_version(torch.__version__, "1.10.0"):
+                autocast_context = torch.amp.autocast('cuda', enabled=amp)
+            else:
+                autocast_context = torch.cuda.amp.autocast(amp)  # PyTorch < 1.10.0 uses positional argument
+            with autocast_context:
                 pred = model(rgb_imgs, ir_imgs)  # forward with dual inputs
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
