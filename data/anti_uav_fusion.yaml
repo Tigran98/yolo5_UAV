@@ -5,7 +5,7 @@
 path: ../yolov8_nano_ssd/data/anti-uav
 
 # Train/val/test image directories  
-train: images/test
+train: images/train
 val: images/val
 test: images/test-2
 
