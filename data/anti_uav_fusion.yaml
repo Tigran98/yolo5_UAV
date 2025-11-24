@@ -1,13 +1,13 @@
 # YOLOv5 🚀 Fusion Model Dataset Configuration
-# Anti-UAV Dataset with RGB + IR modalities
+# Anti-UAV Dataset with RGB + IR modalities - Unified Labeling Format
 
 # Dataset path (relative to yolov5 root)
 path: ../yolov8_nano_ssd/data/anti-uav
 
-# Train/val/test image directories  
-train: images/train
-val: images/val
-test: images/test-2
+# Train/val/test image directories (using unified labeling structure)
+train: images/test_resized
+val: images/val_resized
+test: images/test-2_resized
 
 # Number of classes
 nc: 1
@@ -17,7 +17,10 @@ names:
   0: drone
 
 # Notes:
-# - Images are named with "_visible_" (RGB) and "_infrared_" (IR) keywords
-# - DualModalDataset will automatically pair RGB and IR images
-# - Labels are in YOLO format: labels/train/{image_stem}.txt
-# - Each line in label file: class x_center y_center width height (normalized 0-1)
+# - Dataset uses unified labeling: RGB and IR images are in separate folders
+# - RGB images: images/{set}_resized/rgb/
+# - IR images: images/{set}_resized/ir/
+# - Unified labels: labels/{set}_resized/ (one label file per RGB-IR pair)
+# - Images are already resized to 640x640 (no letterbox needed)
+# - Labels are in YOLO format: class x_center y_center width height (normalized 0-1)
+# - Same label applies to both RGB and IR images (spatially aligned)

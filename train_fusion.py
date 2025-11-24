@@ -85,7 +85,8 @@ from utils.loggers import LOGGERS, Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
 from utils.loss import ComputeLoss
 from utils.metrics import fitness
-from utils.plots import plot_evolve
+from utils.plots import Annotator, colors, plot_evolve
+from utils.general import xywh2xyxy
 from utils.torch_utils import (
     EarlyStopping,
     ModelEMA,
@@ -97,10 +98,107 @@ from utils.torch_utils import (
     torch_distributed_zero_first,
 )
 
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # non-interactive backend
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+import cv2
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = check_git_info()
+
+
+def plot_aligned_pair(rgb_img, ir_img, labels, save_path, epoch, sample_idx, names=None):
+    """
+    Plot aligned RGB and IR images with unified bounding boxes for validation.
+    Uses the same plotting logic as plot_images() to ensure correct IR image display.
+    
+    Args:
+        rgb_img: RGB image (torch.Tensor or numpy array, CHW format, normalized 0-1)
+        ir_img: IR image (torch.Tensor or numpy array, CHW format, normalized 0-1)
+        labels: Labels array (n, 5) in format [class, x_center, y_center, width, height] (normalized)
+        save_path: Path to save the plot
+        epoch: Current epoch number
+        sample_idx: Sample index for filename
+        names: Class names dict (optional)
+    """
+    if plt is None:
+        return
+    
+    # Convert tensors to numpy if needed
+    if isinstance(rgb_img, torch.Tensor):
+        rgb_img = rgb_img.cpu().float().numpy()
+    if isinstance(ir_img, torch.Tensor):
+        ir_img = ir_img.cpu().float().numpy()
+    
+    # Handle normalization: if max <= 1, denormalize to 0-255
+    # This matches the logic in plot_images() from utils/plots.py
+    if np.max(rgb_img) <= 1:
+        rgb_img = rgb_img * 255
+    if np.max(ir_img) <= 1:
+        ir_img = ir_img * 255
+    
+    # Ensure uint8 and clip values to valid range
+    rgb_img = np.clip(rgb_img, 0, 255).astype(np.uint8)
+    ir_img = np.clip(ir_img, 0, 255).astype(np.uint8)
+    
+    # Transpose from CHW to HWC (matches plot_images logic)
+    # Images from dataset are in CHW format (channels, height, width)
+    if len(rgb_img.shape) == 3 and rgb_img.shape[0] == 3:  # CHW format
+        rgb_img = rgb_img.transpose(1, 2, 0)
+    if len(ir_img.shape) == 3 and ir_img.shape[0] == 3:  # CHW format
+        ir_img = ir_img.transpose(1, 2, 0)
+    
+    h, w = rgb_img.shape[:2]
+    
+    # Create side-by-side mosaic
+    mosaic = np.full((h, w * 2, 3), 255, dtype=np.uint8)
+    mosaic[:, :w, :] = rgb_img
+    mosaic[:, w:, :] = ir_img
+    
+    # Create annotator
+    fs = int((h + w) * 0.01)  # font size
+    annotator = Annotator(mosaic, line_width=max(round(fs / 10), 1), font_size=fs, pil=True, example=names)
+    
+    # Draw bounding boxes on RGB (left side) and IR (right side)
+    # Uses same logic as plot_images() from utils/plots.py
+    if len(labels) > 0:
+        # Convert from xywh to xyxy format (matches plot_images logic exactly)
+        boxes = xywh2xyxy(labels[:, 1:5]).T  # Extract [x, y, w, h], convert to xyxy, transpose to (4, n)
+        classes = labels[:, 0].astype(int)
+        
+        # Scale normalized boxes to pixel coordinates (matches plot_images)
+        if boxes.shape[1]:
+            if boxes.max() <= 1.01:  # normalized with tolerance
+                boxes[[0, 2]] *= w  # scale x coordinates
+                boxes[[1, 3]] *= h  # scale y coordinates
+        
+        # Draw boxes on RGB (left side) - boxes are in (4, n) format
+        # Iterate same way as plot_images: boxes.T.tolist() gives list of [x1, y1, x2, y2]
+        for j, box in enumerate(boxes.T.tolist()):
+            cls = classes[j]
+            color = colors(cls)
+            cls_name = names[cls] if names else str(cls)
+            label = f"{cls_name}"
+            annotator.box_label(box, label, color=color)
+        
+        # Draw boxes on IR (right side) - shift x coordinates
+        boxes_ir = boxes.copy()
+        boxes_ir[[0, 2]] += w  # Shift x coordinates to right side
+        for j, box in enumerate(boxes_ir.T.tolist()):
+            cls = classes[j]
+            color = colors(cls)
+            cls_name = names[cls] if names else str(cls)
+            label = f"{cls_name}"
+            annotator.box_label(box, label, color=color)
+    
+    # Save using annotator's image
+    annotator.im.save(save_path)
 
 
 def train(hyp, opt, device, callbacks):
@@ -518,6 +616,43 @@ def train(hyp, opt, device, callbacks):
         scheduler.step()
 
         if RANK in {-1, 0}:
+            # Save aligned validation samples (2-5 random samples per epoch)
+            aligned_samples_dir = save_dir / 'aligned_samples' / f'epoch_{epoch}'
+            aligned_samples_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Sample 2-5 random indices from training dataset
+            num_samples = min(random.randint(2, 5), len(dataset))
+            sample_indices = random.sample(range(len(dataset)), num_samples)
+            
+            for sample_idx, dataset_idx in enumerate(sample_indices):
+                try:
+                    # Temporarily disable augmentation to get original images
+                    original_augment = dataset.augment
+                    dataset.augment = False
+                    
+                    # Load sample from dataset
+                    rgb_img_tensor, ir_img_tensor, labels_tensor, paths, _ = dataset[dataset_idx]
+                    
+                    # Restore augmentation setting
+                    dataset.augment = original_augment
+                    
+                    # Convert labels from tensor to numpy
+                    labels_np = labels_tensor.numpy()
+                    if len(labels_np) > 0:
+                        # Labels are in format [img_idx, class, x, y, w, h] - extract class and bbox
+                        labels_clean = labels_np[:, 1:6]  # Remove img_idx column
+                    else:
+                        labels_clean = np.zeros((0, 5))
+                    
+                    # Get class names from dataset
+                    names = getattr(dataset, 'names', None)
+                    
+                    # Plot and save (pass tensors directly, function handles conversion)
+                    save_path = aligned_samples_dir / f'sample_{sample_idx}.png'
+                    plot_aligned_pair(rgb_img_tensor, ir_img_tensor, labels_clean, str(save_path), epoch, sample_idx, names)
+                except Exception as e:
+                    LOGGER.warning(f"Failed to save aligned sample {sample_idx} at epoch {epoch}: {e}")
+            
             # mAP
             callbacks.run("on_train_epoch_end", epoch=epoch)
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])

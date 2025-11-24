@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import math
 from torch.utils.data import DataLoader, distributed
 
 # Import from existing dataloader
@@ -32,10 +33,111 @@ from utils.torch_utils import torch_distributed_zero_first
 RANK = int(os.getenv("RANK", -1))
 
 
+def apply_synchronized_perspective(rgb_img, ir_img, labels, degrees=10, translate=0.1, scale=0.1, 
+                                   shear=10, perspective=0.0, border=(0, 0)):
+    """
+    Apply synchronized perspective transformation to both RGB and IR images.
+    Generates transformation matrix once and applies it to both images.
+    
+    Args:
+        rgb_img: RGB image (H, W, 3)
+        ir_img: IR image (H, W, 3)
+        labels: Labels array (n, 5) in format [class, x1, y1, x2, y2] (pixel coordinates)
+        degrees, translate, scale, shear, perspective: Augmentation parameters
+        border: Border padding
+        
+    Returns:
+        rgb_img_transformed: Transformed RGB image
+        ir_img_transformed: Transformed IR image
+        labels_transformed: Transformed labels
+    """
+    height = rgb_img.shape[0] + border[0] * 2
+    width = rgb_img.shape[1] + border[1] * 2
+    
+    # Generate transformation matrix (same for both RGB and IR)
+    # Center
+    C = np.eye(3)
+    C[0, 2] = -rgb_img.shape[1] / 2
+    C[1, 2] = -rgb_img.shape[0] / 2
+    
+    # Perspective
+    P = np.eye(3)
+    P[2, 0] = random.uniform(-perspective, perspective)
+    P[2, 1] = random.uniform(-perspective, perspective)
+    
+    # Rotation and Scale
+    R = np.eye(3)
+    a = random.uniform(-degrees, degrees)
+    s = random.uniform(1 - scale, 1 + scale)
+    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+    
+    # Shear
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+    
+    # Translation
+    T = np.eye(3)
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height
+    
+    # Combined transformation matrix
+    M = T @ S @ R @ P @ C
+    
+    # Apply same transformation to RGB
+    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():
+        if perspective:
+            rgb_img_transformed = cv2.warpPerspective(rgb_img, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:
+            rgb_img_transformed = cv2.warpAffine(rgb_img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+    else:
+        rgb_img_transformed = rgb_img.copy()
+    
+    # Apply same transformation to IR
+    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():
+        if perspective:
+            ir_img_transformed = cv2.warpPerspective(ir_img, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:
+            ir_img_transformed = cv2.warpAffine(ir_img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+    else:
+        ir_img_transformed = ir_img.copy()
+    
+    # Transform labels
+    labels_transformed = labels.copy()
+    if len(labels):
+        n = len(labels)
+        xy = np.ones((n * 4, 3))
+        xy[:, :2] = labels[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
+        xy = xy @ M.T
+        xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)
+        
+        # Create new boxes
+        x = xy[:, [0, 2, 4, 6]]
+        y = xy[:, [1, 3, 5, 7]]
+        new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+        
+        # Clip
+        new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
+        new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
+        
+        # Filter candidates (from original random_perspective logic)
+        from utils.augmentations import box_candidates
+        # Use scale factor s from rotation matrix calculation above
+        i = box_candidates(box1=labels[:, 1:5].T * s, box2=new.T, area_thr=0.10)
+        if len(i) > 0:
+            labels_transformed = labels_transformed[i]
+            labels_transformed[:, 1:5] = new[i]
+        else:
+            labels_transformed = np.zeros((0, 5), dtype=np.float32)
+    
+    return rgb_img_transformed, ir_img_transformed, labels_transformed
+
+
 class LoadFusionImages:
     """
     YOLOv5 Fusion Model image loader for paired RGB and IR images.
-    Loads RGB images and finds corresponding IR images by replacing 'visible' with 'infrared'.
+    Loads RGB and IR images from separate rgb/ and ir/ directories.
+    Images are already 640x640, no resizing needed.
     """
     
     def __init__(self, path, img_size=640, stride=32, auto=True):
@@ -43,38 +145,44 @@ class LoadFusionImages:
         Initialize fusion image loader.
         
         Args:
-            path: Path to RGB images (directory, file, or glob pattern)
-            img_size: Target image size
+            path: Path to images directory (should contain rgb/ and ir/ subdirectories)
+            img_size: Target image size (640, images already resized)
             stride: Model stride
-            auto: Auto-resize
+            auto: Auto-resize (ignored, images already 640x640)
         """
-        if isinstance(path, str) and Path(path).suffix == ".txt":
-            path = Path(path).read_text().rsplit()
+        path = Path(path)
         
-        files = []
-        for p in sorted(path) if isinstance(path, (list, tuple)) else [path]:
-            p = str(Path(p).resolve())
-            if "*" in p:
-                files.extend(sorted(glob.glob(p, recursive=True)))
-            elif os.path.isdir(p):
-                files.extend(sorted(glob.glob(os.path.join(p, "*.*"))))
-            elif os.path.isfile(p):
-                files.append(p)
-            else:
-                raise FileNotFoundError(f"{p} does not exist")
+        # Find RGB and IR directories
+        rgb_dir = path / 'rgb'
+        ir_dir = path / 'ir'
         
-        # Filter to only RGB (visible) images that have IR pairs
+        if not rgb_dir.exists():
+            raise FileNotFoundError(f"RGB directory not found: {rgb_dir}")
+        if not ir_dir.exists():
+            raise FileNotFoundError(f"IR directory not found: {ir_dir}")
+        
+        # Discover RGB images
+        rgb_files = sorted(glob.glob(str(rgb_dir / "*.*")))
+        rgb_files = [f for f in rgb_files if f.split(".")[-1].lower() in IMG_FORMATS]
+        
+        # Discover IR images and match by filename
+        ir_files_dict = {}
+        ir_files_list = sorted(glob.glob(str(ir_dir / "*.*")))
+        for ir_file in ir_files_list:
+            if ir_file.split(".")[-1].lower() in IMG_FORMATS:
+                ir_name = Path(ir_file).stem
+                ir_files_dict[ir_name] = ir_file
+        
+        # Match RGB and IR files by base filename
         self.rgb_files = []
         self.ir_files = []
-        for f in files:
-            if f.split(".")[-1].lower() in IMG_FORMATS:
-                if "visible" in f:
-                    ir_file = f.replace("visible", "infrared")
-                    if os.path.exists(ir_file):
-                        self.rgb_files.append(f)
-                        self.ir_files.append(ir_file)
-                    else:
-                        LOGGER.warning(f"No IR pair found for {f}, skipping")
+        for rgb_file in rgb_files:
+            rgb_name = Path(rgb_file).stem
+            if rgb_name in ir_files_dict:
+                self.rgb_files.append(rgb_file)
+                self.ir_files.append(ir_files_dict[rgb_name])
+            else:
+                LOGGER.warning(f"No IR pair found for RGB image: {rgb_file}, skipping")
         
         self.nf = len(self.rgb_files)
         assert self.nf > 0, f"No RGB-IR image pairs found in {path}"
@@ -106,9 +214,9 @@ class LoadFusionImages:
         ir_im0 = cv2.imread(ir_path)  # BGR
         assert ir_im0 is not None, f"IR Image Not Found {ir_path}"
         
-        # Resize both images
-        rgb_im = letterbox(rgb_im0, self.img_size, stride=self.stride, auto=self.auto)[0]
-        ir_im = letterbox(ir_im0, self.img_size, stride=self.stride, auto=self.auto)[0]
+        # Images are already 640x640, no letterbox/resizing needed
+        rgb_im = rgb_im0.copy()
+        ir_im = ir_im0.copy()
         
         # Convert to CHW, BGR to RGB
         rgb_im = rgb_im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
@@ -151,164 +259,151 @@ class DualModalDataset(LoadImagesAndLabels):
         seed=0,
     ):
         """
-        Initialize dual-modal dataset loader.
+        Initialize dual-modal dataset loader for unified labeling format.
+        
+        Expected structure:
+        - path/images/{set}_resized/rgb/  (RGB images)
+        - path/images/{set}_resized/ir/   (IR images)
+        - path/labels/{set}_resized/      (unified labels)
         
         Args:
             All args same as LoadImagesAndLabels
         """
-        # Initialize parent class first
-        super().__init__(
-            path=path,
-            img_size=img_size,
-            batch_size=batch_size,
-            augment=augment,
-            hyp=hyp,
-            rect=rect,
-            image_weights=image_weights,
-            cache_images=cache_images,
-            single_cls=single_cls,
-            stride=stride,
-            pad=pad,
-            min_items=min_items,
-            prefix=prefix,
-            rank=rank,
-            seed=seed,
-        )
+        # Set basic attributes before calling parent
+        self.img_size = img_size
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.path = path
         
-        # Store original file lists before filtering (parent class has already set these)
-        original_im_files = list(self.im_files)
-        original_label_files = list(self.label_files)
-        original_labels = list(self.labels)
-        original_shapes = self.shapes.copy()
+        # Discover RGB and IR files from separate directories
+        # Path format: root/images/{set}_resized
+        path = Path(path) if isinstance(path, str) else path
+        path_str = str(path.resolve())
         
-        # Filter to only keep visible (RGB) images that have IR pairs
+        # Find RGB and IR directories
+        rgb_dir = path / 'rgb'
+        ir_dir = path / 'ir'
+        
+        if not rgb_dir.exists():
+            raise FileNotFoundError(f"{prefix}RGB directory not found: {rgb_dir}")
+        if not ir_dir.exists():
+            raise FileNotFoundError(f"{prefix}IR directory not found: {ir_dir}")
+        
+        # Discover RGB images
+        rgb_files = sorted(glob.glob(str(rgb_dir / "*.*")))
+        rgb_files = [f for f in rgb_files if f.split(".")[-1].lower() in IMG_FORMATS]
+        
+        # Discover IR images and match by filename
+        ir_files_dict = {}
+        ir_files_list = sorted(glob.glob(str(ir_dir / "*.*")))
+        for ir_file in ir_files_list:
+            if ir_file.split(".")[-1].lower() in IMG_FORMATS:
+                ir_name = Path(ir_file).stem  # filename without extension
+                ir_files_dict[ir_name] = ir_file
+        
+        # Match RGB and IR files by base filename
         self.rgb_files = []
         self.ir_files = []
-        filtered_indices = []
+        matched_names = []
         
-        for i, img_file in enumerate(original_im_files):
-            if 'visible' in img_file:
-                # This is an RGB image
-                ir_file = img_file.replace('visible', 'infrared')
-                if os.path.exists(ir_file):
-                    self.rgb_files.append(img_file)
-                    self.ir_files.append(ir_file)
-                    filtered_indices.append(i)
-                else:
-                    if rank in {-1, 0}:
-                        LOGGER.warning(f"{prefix}No IR pair found for {img_file}")
-        
-        # Update the file lists to filtered pairs
-        self.im_files = self.rgb_files
-        self.n = len(self.rgb_files)
-        
-        # Update label files: labels may be stored with _visible or _infrared suffix
-        # Convert RGB image paths to label paths by replacing /images/ with /labels/
-        # Prefer _infrared label files, fallback to _visible
-        from utils.dataloaders import img2label_paths
-        label_files_raw = img2label_paths(self.rgb_files)
-        self.label_files = []
-        for i, (rgb_file, label_file_raw) in enumerate(zip(self.rgb_files, label_files_raw)):
-            # First try _infrared label file (preferred)
-            label_file_infrared = label_file_raw.replace('_visible', '_infrared')
-            if os.path.exists(label_file_infrared):
-                label_file = label_file_infrared
-            elif os.path.exists(label_file_raw):
-                # Fallback to _visible label file
-                label_file = label_file_raw
+        for rgb_file in rgb_files:
+            rgb_name = Path(rgb_file).stem
+            if rgb_name in ir_files_dict:
+                self.rgb_files.append(rgb_file)
+                self.ir_files.append(ir_files_dict[rgb_name])
+                matched_names.append(rgb_name)
             else:
-                # If neither exists, use original (will be empty)
-                label_file = label_file_raw
-            self.label_files.append(label_file)
+                if rank in {-1, 0}:
+                    LOGGER.warning(f"{prefix}No IR pair found for RGB image: {rgb_file}")
         
-        # Reload labels with corrected label file paths
-        # We need to re-run cache_labels or manually load labels
-        # For now, filter labels from original, but we'll need to reload them
-        filtered_labels = []
-        filtered_shapes = []
+        assert len(self.rgb_files) > 0, f"{prefix}No RGB-IR pairs found in {path}"
+        
+        # Find label directory (unified labels)
+        # Extract set name from path: images/{set}_resized -> labels/{set}_resized
+        path_parts = path_str.split(os.sep)
+        set_name = None
+        for part in reversed(path_parts):
+            if part.endswith('_resized'):
+                set_name = part
+                break
+        
+        if set_name is None:
+            # Fallback: try to find labels directory relative to images
+            label_dir = path.parent.parent / 'labels' / path.name
+        else:
+            # Construct label path: replace images/{set}_resized with labels/{set}_resized
+            label_dir = Path(path_str.replace(os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep))
+        
+        if not label_dir.exists():
+            raise FileNotFoundError(f"{prefix}Label directory not found: {label_dir}")
+        
+        # Load unified labels
+        self.label_files = []
+        self.labels = []
+        self.shapes = []
         labels_found = 0
         labels_total = 0
-        for i, idx in enumerate(filtered_indices):
-            # Reload label for this specific file
-            label_file = self.label_files[i]
-            if os.path.exists(label_file):
+        
+        for rgb_name in matched_names:
+            label_file = label_dir / f"{rgb_name}.txt"
+            self.label_files.append(str(label_file))
+            
+            if label_file.exists():
                 try:
                     with open(label_file) as f:
                         lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
                         if len(lb):
                             lb = np.array(lb, dtype=np.float32)
                             if lb.shape[1] == 5:  # class, x, y, w, h
-                                filtered_labels.append(lb)
+                                self.labels.append(lb)
                                 labels_found += len(lb)
                                 labels_total += len(lb)
                             else:
-                                filtered_labels.append(np.zeros((0, 5), dtype=np.float32))
+                                self.labels.append(np.zeros((0, 5), dtype=np.float32))
                         else:
-                            filtered_labels.append(np.zeros((0, 5), dtype=np.float32))
+                            self.labels.append(np.zeros((0, 5), dtype=np.float32))
                 except Exception as e:
                     if rank in {-1, 0}:
                         LOGGER.warning(f"{prefix}Error loading label {label_file}: {e}")
-                    filtered_labels.append(np.zeros((0, 5), dtype=np.float32))
+                    self.labels.append(np.zeros((0, 5), dtype=np.float32))
             else:
-                filtered_labels.append(np.zeros((0, 5), dtype=np.float32))
+                self.labels.append(np.zeros((0, 5), dtype=np.float32))
             
-            # Use shape from original if available
-            if idx < len(original_shapes):
-                filtered_shapes.append(original_shapes[idx])
-            else:
-                filtered_shapes.append((640, 640))  # Default shape
+            # Images are already 640x640, no resizing needed
+            self.shapes.append((640, 640))
         
-        self.labels = filtered_labels
-        self.shapes = np.array(filtered_shapes)
+        self.shapes = np.array(self.shapes)
+        self.im_files = self.rgb_files  # For compatibility with parent class
         
         # Log label statistics
         if rank in {-1, 0}:
-            non_empty = sum(1 for lb in filtered_labels if len(lb) > 0)
-            LOGGER.info(f"{prefix}Loaded {len(filtered_labels)} labels ({non_empty} non-empty, {labels_total} total annotations)")
+            non_empty = sum(1 for lb in self.labels if len(lb) > 0)
+            LOGGER.info(f"{prefix}Loaded {len(self.labels)} unified labels ({non_empty} non-empty, {labels_total} total annotations)")
         
-        # Recalculate batch indices after filtering
+        # Create indices
         n = len(self.shapes)
         bi = np.floor(np.arange(n) / batch_size).astype(int)
         nb = bi[-1] + 1
         self.batch = bi
         self.n = n
+        self.indices = np.arange(n)
         
-        # CRITICAL: Recreate indices for filtered dataset
-        # The parent class created self.indices pointing to original dataset indices
-        # After filtering, we need to create new indices pointing to filtered dataset
-        # Create mapping from original index to filtered index position
-        original_to_filtered = {orig_idx: filt_idx for filt_idx, orig_idx in enumerate(filtered_indices)}
-        
-        # Filter self.indices to only include indices that exist in filtered dataset
-        # and map them to their position in the filtered dataset
-        filtered_indices_set = set(filtered_indices)
-        new_indices = []
-        for orig_idx in self.indices:
-            if orig_idx in filtered_indices_set:
-                # Map original index to filtered position
-                new_indices.append(original_to_filtered[orig_idx])
-        
-        # Update indices - use mapped indices if we have them, otherwise create fresh ones
-        if len(new_indices) > 0:
-            self.indices = np.array(new_indices)
-        else:
-            # Fallback: create fresh indices (shouldn't happen if filtering worked)
-            self.indices = np.arange(n)
-        
-        # Handle DDP case - need to re-filter for DDP after mapping
-        if rank > -1:  # DDP mode
+        # Handle DDP case
+        if rank > -1:
             from utils.dataloaders import WORLD_SIZE
-            # Filter indices to match DDP rank
-            self.indices = self.indices[np.random.RandomState(seed=seed).permutation(len(self.indices)) % WORLD_SIZE == RANK]
+            self.indices = self.indices[np.random.RandomState(seed=seed).permutation(n) % WORLD_SIZE == RANK]
         
-        # Also need to update batch_shapes if rect mode is used
+        # Rectangular Training
         if self.rect:
-            # Recalculate batch shapes for filtered dataset
-            # Similar to parent class logic
             s = self.shapes  # wh
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             irect = ar.argsort()
-            self.shapes = s[irect]  # wh
+            self.shapes = s[irect]
             self.im_files = [self.im_files[i] for i in irect]
             self.rgb_files = [self.rgb_files[i] for i in irect]
             self.ir_files = [self.ir_files[i] for i in irect]
@@ -317,7 +412,6 @@ class DualModalDataset(LoadImagesAndLabels):
             if hasattr(self, 'segments'):
                 self.segments = [self.segments[i] for i in irect]
             ar = ar[irect]
-            # Set training image shapes
             shapes = [[1, 1]] * nb
             for i in range(nb):
                 ari = ar[bi == i]
@@ -331,34 +425,103 @@ class DualModalDataset(LoadImagesAndLabels):
         else:
             self.batch_shapes = None
         
-        # Store cache setting
-        self.cache_images_setting = cache_images
+        # Single class handling
+        if single_cls:
+            for i in range(len(self.labels)):
+                if len(self.labels[i]) > 0:
+                    self.labels[i][:, 0] = 0
         
-        # Reinitialize imgs cache to match filtered files
+        # Cache images
+        self.cache_images_setting = cache_images
         if cache_images:
             self.imgs = [None] * self.n
-            self.ir_imgs = [None] * self.n  # Separate cache for IR images
+            self.ir_imgs = [None] * self.n
         else:
             self.imgs = [None] * self.n
             self.ir_imgs = None
         
-        # NOTE: self.indices was already set above with mapped indices - DO NOT overwrite!
+        # Initialize segments (for compatibility)
+        self.segments = [None] * self.n
         
         if rank in {-1, 0}:
             LOGGER.info(f"{prefix}Found {self.n} RGB-IR image pairs (cache: {cache_images})")
     
+    def load_mosaic_pair(self, index):
+        """
+        Load synchronized 4-image mosaic for both RGB and IR.
+        Uses same indices, same mosaic center, and same layout for both modalities.
+        
+        Args:
+            index: Primary image index
+            
+        Returns:
+            rgb_img4: RGB mosaic image (1280x1280)
+            ir_img4: IR mosaic image (1280x1280)
+            labels4: Combined labels from 4 images
+        """
+        labels4 = []
+        s = self.img_size  # 640
+        # Same mosaic center for both RGB and IR
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)
+        
+        # Select same 4 indices for both RGB and IR
+        indices = [index] + random.choices(self.indices, k=3)
+        random.shuffle(indices)
+        
+        # Initialize mosaic images
+        rgb_img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+        ir_img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+        
+        for i, idx in enumerate(indices):
+            # Load RGB-IR pair
+            rgb_img, ir_img, (h0, w0), (h, w) = self.load_image_pair(idx)
+            
+            # Same layout coordinates for both RGB and IR
+            if i == 0:  # top left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+            
+            # Place images in mosaic (same coordinates for both)
+            rgb_img4[y1a:y2a, x1a:x2a] = rgb_img[y1b:y2b, x1b:x2b]
+            ir_img4[y1a:y2a, x1a:x2a] = ir_img[y1b:y2b, x1b:x2b]
+            
+            padw = x1a - x1b
+            padh = y1a - y1b
+            
+            # Transform labels
+            labels = self.labels[idx].copy()
+            if labels.size:
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w=640, h=640, padw=padw, padh=padh)
+            labels4.append(labels)
+        
+        # Concatenate and clip labels
+        labels4 = np.concatenate(labels4, 0)
+        np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])
+        
+        return rgb_img4, ir_img4, labels4
+    
     def load_image_pair(self, index):
         """
         Load paired RGB and IR images.
+        Images are already 640x640, no resizing needed.
         
         Args:
             index: Dataset index
             
         Returns:
-            rgb_img: RGB image (H, W, 3)
-            ir_img: IR image (H, W, 3)
-            (h0, w0): Original image size
-            (h, w): Resized image size
+            rgb_img: RGB image (H, W, 3) - already 640x640
+            ir_img: IR image (H, W, 3) - already 640x640
+            (h0, w0): Original image size (640, 640)
+            (h, w): Resized image size (640, 640)
         """
         # Load RGB image
         rgb_path = self.rgb_files[index]
@@ -368,13 +531,11 @@ class DualModalDataset(LoadImagesAndLabels):
             rgb_img = cv2.imread(rgb_path)  # BGR
             if rgb_img is None:
                 raise FileNotFoundError(f"Image not found: {rgb_path}")
-            h0, w0 = rgb_img.shape[:2]  # orig hw
             
-            # Resize
-            r = self.img_size / max(h0, w0)  # ratio
-            if r != 1:  # if sizes are not equal
-                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                rgb_img = cv2.resize(rgb_img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            # Verify image is 640x640 (should already be resized)
+            h0, w0 = rgb_img.shape[:2]
+            if h0 != 640 or w0 != 640:
+                LOGGER.warning(f"RGB image {rgb_path} is {w0}x{h0}, expected 640x640")
             
             # Cache if enabled
             if self.cache_images_setting:
@@ -393,11 +554,10 @@ class DualModalDataset(LoadImagesAndLabels):
             if ir_img is None:
                 raise FileNotFoundError(f"IR image not found: {ir_path}")
             
-            # Resize to same size as RGB (same ratio)
-            r = self.img_size / max(h0, w0)
-            if r != 1:
-                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                ir_img = cv2.resize(ir_img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            # Verify image is 640x640 (should already be resized)
+            ir_h, ir_w = ir_img.shape[:2]
+            if ir_h != 640 or ir_w != 640:
+                LOGGER.warning(f"IR image {ir_path} is {ir_w}x{ir_h}, expected 640x640")
             
             # Cache if enabled
             if self.cache_images_setting:
@@ -409,92 +569,67 @@ class DualModalDataset(LoadImagesAndLabels):
         return rgb_img, ir_img, (h0, w0), (h, w)
     
     def __getitem__(self, index):
-        """Fetches paired RGB-IR dataset item with synchronized augmentation."""
-        # Map dataset index to filtered dataset index
-        # self.indices now contains filtered indices directly
+        """Fetches paired RGB-IR dataset item with synchronized augmentation.
+        Images are already 640x640, no letterbox/resizing needed.
+        """
         mapped_index = self.indices[index] if hasattr(self, 'indices') and len(self.indices) > index else index
         
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp["mosaic"]
         
         if mosaic:
-            # Mosaic augmentation - use parent's load_mosaic but adapt for dual inputs
-            # For simplicity, disable mosaic for now (can be enhanced later)
-            # Load single pair instead
-            rgb_img, ir_img, (h0, w0), (h, w) = self.load_image_pair(mapped_index)
-            labels = self.labels[mapped_index].copy()
-            
-            # In mosaic path, labels are in normalized xywh format
-            # Need to convert to xyxy format for random_perspective
-            # Also need to letterbox the image
-            shape = self.img_size
-            rgb_img, ratio, pad = letterbox(rgb_img, shape, auto=False, scaleup=self.augment)
-            ir_img, _, _ = letterbox(ir_img, shape, auto=False, scaleup=self.augment)
-            
-            # Convert labels from normalized xywh to pixel xyxy
-            if labels.size:
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
-            
+            # Synchronized mosaic augmentation - load 4 RGB-IR pairs with same layout
+            rgb_img, ir_img, labels = self.load_mosaic_pair(mapped_index)
             shapes = None
         else:
             # Load single pair
             rgb_img, ir_img, (h0, w0), (h, w) = self.load_image_pair(mapped_index)
             
-            # Letterbox
-            shape = self.batch_shapes[self.batch[mapped_index]] if self.rect and self.batch_shapes is not None else self.img_size
-            rgb_img, ratio, pad = letterbox(rgb_img, shape, auto=False, scaleup=self.augment)
-            ir_img, _, _ = letterbox(ir_img, shape, auto=False, scaleup=self.augment)  # Same shape
-            
-            shapes = (h0, w0), ((h / h0, w / w0), pad)
+            # Images are already 640x640, no letterbox needed
+            shapes = (h0, w0), ((1.0, 1.0), (0, 0))  # No scaling or padding
             
             labels = self.labels[mapped_index].copy()
             
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+            # Convert labels from normalized xywh to pixel xyxy format
+            if labels.size:
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w=640, h=640, padw=0, padh=0)
         
         # Synchronized augmentation
         if self.augment:
-            # Random perspective (same transform for both)
-            # Store random state before first transform
-            random_state = random.getstate()
-            rgb_img, labels = random_perspective(
-                rgb_img,
-                labels,
+            if mosaic:
+                # For mosaic, use border for perspective transform
+                border = self.mosaic_border
+            else:
+                border = (0, 0)
+            
+            # Synchronized random perspective (same transform matrix for both RGB and IR)
+            rgb_img, ir_img, labels = apply_synchronized_perspective(
+                rgb_img, ir_img, labels,
                 degrees=hyp["degrees"],
                 translate=hyp["translate"],
                 scale=hyp["scale"],
                 shear=hyp["shear"],
                 perspective=hyp["perspective"],
-            )
-            # Apply same transform to IR by restoring random state
-            # Note: This ensures same random parameters but not exact same matrix
-            # For perfect synchronization, we'd need to capture and reuse the transform matrix
-            random.setstate(random_state)
-            ir_img, _ = random_perspective(
-                ir_img,
-                labels.copy(),  # Dummy labels for IR (not used in transform)
-                degrees=hyp["degrees"],
-                translate=hyp["translate"],
-                scale=hyp["scale"],
-                shear=hyp["shear"],
-                perspective=hyp["perspective"],
+                border=border
             )
             
             # HSV augmentation (RGB only, IR doesn't have color)
             augment_hsv(rgb_img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
             
-            # Synchronized flips
-            if random.random() < hyp["flipud"]:
+            # Synchronized flips (same random decision for both)
+            flip_ud = random.random() < hyp["flipud"]
+            if flip_ud:
                 rgb_img = np.flipud(rgb_img)
                 ir_img = np.flipud(ir_img)
                 if len(labels):
-                    labels[:, 2] = 1 - labels[:, 2]
+                    labels[:, 2] = 1 - labels[:, 2]  # Flip y coordinates
             
-            if random.random() < hyp["fliplr"]:
+            flip_lr = random.random() < hyp["fliplr"]
+            if flip_lr:
                 rgb_img = np.fliplr(rgb_img)
                 ir_img = np.fliplr(ir_img)
                 if len(labels):
-                    labels[:, 1] = 1 - labels[:, 1]
+                    labels[:, 1] = 1 - labels[:, 1]  # Flip x coordinates
         
         nl = len(labels)  # number of labels
         if nl:
@@ -504,7 +639,6 @@ class DualModalDataset(LoadImagesAndLabels):
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
         else:
-            # Empty labels - create empty tensor with correct shape
             labels_out = torch.zeros((0, 6))
         
         # Convert to CHW, BGR to RGB
