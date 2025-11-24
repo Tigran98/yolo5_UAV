@@ -5,7 +5,7 @@
 path: ../yolov8_nano_ssd/data/anti-uav
 
 # Train/val/test image directories (using unified labeling structure)
-train: images/test_resized
+train: images/train_resized
 val: images/val_resized
 test: images/test-2_resized
 
