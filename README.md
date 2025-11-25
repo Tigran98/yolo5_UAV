@@ -41,13 +41,13 @@ The system follows a modified YOLOv5 architecture:
 ```mermaid
 graph TD
     subgraph Inputs
-    RGB[RGB Image 640x640]
-    IR[IR Image 640x640]
+    RGB["RGB Image 640x640"]
+    IR["IR Image 640x640"]
     end
 
     subgraph Backbones
-    B1[RGB Backbone (CSPDarknet)]
-    B2[IR Backbone (CSPDarknet)]
+    B1["RGB Backbone (CSPDarknet)"]
+    B2["IR Backbone (CSPDarknet)"]
     RGB --> B1
     IR --> B2
     end
