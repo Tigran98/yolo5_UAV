@@ -347,8 +347,8 @@ def main():
     print(f"    ├── images/")
     for set_name in sorted(set_folders):
         print(f"    │   ├── {set_name}_resized/")
-        print(f"    │   │   ├── rgb/     (aligned RGB images)")
-        print(f"    │   │   └── ir/      (resized IR images)")
+    print(f"    │   │   ├── rgb/     (aligned RGB images)")
+    print(f"    │   │   └── ir/      (resized IR images)")
     print(f"    └── labels/")
     for set_name in sorted(set_folders):
         print(f"        └── {set_name}_resized/  (unified labels)")

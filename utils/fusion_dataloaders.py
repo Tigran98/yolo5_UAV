@@ -234,6 +234,161 @@ class LoadFusionImages:
         return self.nf
 
 
+class LoadFusionVideo:
+    """
+    YOLOv5 Fusion Model video loader for RGB and IR videos.
+    Supports:
+    - Single RGB video (IR simulated from RGB grayscale)
+    - Dual RGB+IR videos (proper RGB-to-IR alignment preprocessing)
+    """
+    
+    def __init__(self, rgb_path, ir_path=None, img_size=640, stride=32, auto=True, vid_stride=1):
+        """
+        Initialize fusion video loader.
+        
+        Args:
+            rgb_path: Path to RGB video file
+            ir_path: Optional path to IR video file. If None, IR is simulated from RGB (grayscale)
+            img_size: Target image size (640)
+            stride: Model stride
+            auto: Auto-resize
+            vid_stride: Video frame stride (process every nth frame)
+        """
+        rgb_path = str(Path(rgb_path).resolve())
+        
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.vid_stride = vid_stride
+        self.rgb_path = rgb_path
+        self.ir_path = str(Path(ir_path).resolve()) if ir_path else None
+        self.mode = "video"
+        self.has_ir_video = ir_path is not None
+        
+        # Open RGB video
+        self.rgb_cap = cv2.VideoCapture(rgb_path)
+        assert self.rgb_cap.isOpened(), f"Failed to open RGB video: {rgb_path}"
+        
+        # Open IR video if provided
+        if self.has_ir_video:
+            self.ir_cap = cv2.VideoCapture(self.ir_path)
+            assert self.ir_cap.isOpened(), f"Failed to open IR video: {self.ir_path}"
+        else:
+            self.ir_cap = None
+        
+        # Get video properties from RGB video
+        self.frames = int(self.rgb_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = self.rgb_cap.get(cv2.CAP_PROP_FPS)
+        self.w = int(self.rgb_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.h = int(self.rgb_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Verify IR video matches RGB video properties if provided
+        if self.has_ir_video:
+            ir_frames = int(self.ir_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            ir_fps = self.ir_cap.get(cv2.CAP_PROP_FPS)
+            ir_w = int(self.ir_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            ir_h = int(self.ir_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            if ir_frames != self.frames:
+                LOGGER.warning(f"IR video has {ir_frames} frames, RGB has {self.frames} frames. Using minimum.")
+                self.frames = min(ir_frames, self.frames)
+            
+            LOGGER.info(f"RGB Video: {self.frames} frames ({self.w}x{self.h}) at {self.fps:.2f} FPS")
+            LOGGER.info(f"IR Video: {ir_frames} frames ({ir_w}x{ir_h}) at {ir_fps:.2f} FPS")
+        else:
+            LOGGER.info(f"Video: {self.frames} frames ({self.w}x{self.h}) at {self.fps:.2f} FPS (IR simulated from RGB)")
+        
+        self.count = 0
+        self.frame = 0
+    
+    def __iter__(self):
+        """Initialize iterator."""
+        self.count = 0
+        self.frame = 0
+        self.rgb_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
+        if self.has_ir_video:
+            self.ir_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
+        return self
+    
+    def __next__(self):
+        """Load next video frame."""
+        # Apply vid_stride to RGB video
+        for _ in range(self.vid_stride):
+            ret_val = self.rgb_cap.grab()
+            if not ret_val:
+                raise StopIteration
+        
+        ret_val, rgb_im0 = self.rgb_cap.retrieve()
+        if not ret_val:
+            raise StopIteration
+        
+        # Load IR frame if IR video is provided
+        if self.has_ir_video:
+            # Apply same vid_stride to IR video
+            for _ in range(self.vid_stride):
+                ret_val_ir = self.ir_cap.grab()
+                if not ret_val_ir:
+                    raise StopIteration
+            
+            ret_val_ir, ir_im0 = self.ir_cap.retrieve()
+            if not ret_val_ir:
+                raise StopIteration
+        else:
+            # Convert RGB frame to grayscale for IR simulation (3-channel grayscale)
+            ir_im0 = cv2.cvtColor(rgb_im0, cv2.COLOR_BGR2GRAY)
+            ir_im0 = cv2.cvtColor(ir_im0, cv2.COLOR_GRAY2BGR)  # Convert back to 3-channel
+        
+        self.frame += self.vid_stride
+        
+        # Apply preprocessing matching training pipeline
+        # Ensure both RGB and IR are exactly the same size (640x640) for fusion
+        from utils.dataloaders import letterbox
+        
+        # Resize both RGB and IR to exactly img_size x img_size
+        # Use consistent preprocessing to ensure spatial dimensions match exactly
+        # This is critical for fusion - both must be exactly the same size
+        # Use auto=False to ensure exact size without stride rounding differences
+        # Handle img_size as int or list
+        img_size_val = self.img_size[0] if isinstance(self.img_size, (list, tuple)) else self.img_size
+        rgb_im, rgb_ratio, rgb_pad = letterbox(rgb_im0, img_size_val, stride=self.stride, auto=False)
+        ir_im, ir_ratio, ir_pad = letterbox(ir_im0, img_size_val, stride=self.stride, auto=False)
+        
+        # Verify both are exactly the same size (should be guaranteed with auto=False)
+        target_size = (img_size_val, img_size_val)
+        assert rgb_im.shape[:2] == ir_im.shape[:2] == target_size, \
+            f"Size mismatch: RGB={rgb_im.shape[:2]}, IR={ir_im.shape[:2]}, target={target_size}"
+        
+        # Store preprocessing info for coordinate transformation
+        # ratio = (r, r) where r = new/old, pad = (dw, dh)
+        # For scale_boxes: gain = old/new = 1/r, pad = (dw, dh)
+        self.rgb_ratio_pad = ((1.0 / rgb_ratio[0], 1.0 / rgb_ratio[1]), rgb_pad) if rgb_ratio[0] > 0 else ((1.0, 1.0), (0.0, 0.0))
+        self.ir_ratio_pad = ((1.0 / ir_ratio[0], 1.0 / ir_ratio[1]), ir_pad) if ir_ratio[0] > 0 else ((1.0, 1.0), (0.0, 0.0))
+        self.rgb_im0_shape = rgb_im0.shape[:2]  # (H, W)
+        self.ir_im0_shape = ir_im0.shape[:2]  # (H, W)
+        
+        # Convert to CHW, BGR to RGB
+        rgb_im = rgb_im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        rgb_im = np.ascontiguousarray(rgb_im)
+        
+        ir_im = ir_im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        ir_im = np.ascontiguousarray(ir_im)
+        
+        s = f"video frame {self.frame}/{self.frames} {self.rgb_path}: "
+        
+        return self.rgb_path, rgb_im, ir_im, rgb_im0, ir_im0, s
+    
+    def __len__(self):
+        """Return number of frames."""
+        return self.frames // self.vid_stride
+    
+    def __del__(self):
+        """Release video capture."""
+        if hasattr(self, 'rgb_cap'):
+            self.rgb_cap.release()
+        if hasattr(self, 'ir_cap') and self.ir_cap is not None:
+            self.ir_cap.release()
+
+
 class DualModalDataset(LoadImagesAndLabels):
     """
     Dataset loader for paired RGB and IR images for fusion model.

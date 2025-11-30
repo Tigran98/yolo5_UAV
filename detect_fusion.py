@@ -28,6 +28,10 @@ Usage - formats:
                                  yolov5s_paddle_model       # PaddlePaddle
 """
 
+import pathlib
+temp = pathlib.PosixPath
+pathlib.PosixPath = pathlib.WindowsPath
+
 import argparse
 import csv
 import os
@@ -47,7 +51,7 @@ from ultralytics.utils.plotting import Annotator, colors, save_one_box
 
 from models.fusion_model import FusionModel
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS
-from utils.fusion_dataloaders import LoadFusionImages
+from utils.fusion_dataloaders import LoadFusionImages, LoadFusionVideo
 from utils.general import (
     LOGGER,
     Profile,
@@ -111,7 +115,8 @@ from utils.torch_utils import select_device, smart_inference_mode
 @smart_inference_mode()
 def run(
     weights=ROOT / "yolov5s.pt",  # model path or triton URL
-    source=ROOT / "data/images",  # file/dir/URL/glob/screen/0(webcam)
+    source=ROOT / "data/images",  # file/dir/URL/glob/screen/0(webcam) or RGB video
+    ir_source=None,  # optional IR video file path
     data=ROOT / "data/coco128.yaml",  # dataset.yaml path
     imgsz=(640, 640),  # inference size (height, width)
     conf_thres=0.25,  # confidence threshold
@@ -196,6 +201,7 @@ def run(
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".streams") or (is_url and not is_file)
     screenshot = source.lower().startswith("screen")
+    is_video = Path(source).suffix[1:].lower() in VID_FORMATS
     if is_url and is_file:
         source = check_file(source)  # download
 
@@ -206,16 +212,42 @@ def run(
     # Load model (fusion model)
     device = select_device(device)
     # Load fusion model directly (not using DetectMultiBackend)
+    if isinstance(weights, list):
+        weights = weights[0]
     ckpt = torch.load(weights, map_location=device)
     if isinstance(ckpt, dict):
-        model_yaml = ckpt.get('yaml', data) if data else None
-        if model_yaml:
-            from models.fusion_model import FusionModel
-            model = FusionModel(model_yaml, ch=3, nc=None)
-            ckpt = {k.replace('model.', ''): v for k, v in ckpt.items() if k.startswith('model.')}
-            model.load_state_dict(ckpt, strict=False)
+        # Try to get model yaml from checkpoint, otherwise use default fusion model yaml
+        model_yaml = ckpt.get('yaml', None)
+        if model_yaml is None:
+            # Use default fusion model yaml if checkpoint doesn't have it
+            model_yaml = ROOT / 'models' / 'yolov5n_fusion.yaml'
+            if not model_yaml.exists():
+                raise FileNotFoundError(f"Default model yaml not found: {model_yaml}. Please specify model config.")
+        
+        from models.fusion_model import FusionModel
+        model = FusionModel(model_yaml, ch=3, nc=None)
+        
+        # Extract model state dict from checkpoint
+        # Checkpoint structure: {'model': model_object, 'epoch': ..., etc.}
+        if 'model' in ckpt:
+            model_state = ckpt['model']
+            # If it's a model object, get its state_dict; otherwise it's already a state_dict
+            if hasattr(model_state, 'state_dict'):
+                model_state = model_state.state_dict()
+            # Remove 'model.' prefix if present in keys
+            model_state = {k.replace('model.', ''): v for k, v in model_state.items()}
         else:
-            raise ValueError("Fusion model checkpoint must contain 'yaml' key or provide --data")
+            # Fallback: try to find state dict with 'model.' prefix
+            model_state = {k.replace('model.', ''): v for k, v in ckpt.items() if k.startswith('model.')}
+            if not model_state:
+                raise ValueError("Could not find model state dict in checkpoint")
+        
+        # Load state dict
+        missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+        if missing_keys:
+            LOGGER.warning(f"Missing keys when loading checkpoint: {missing_keys[:5]}...")  # Show first 5
+        if unexpected_keys:
+            LOGGER.warning(f"Unexpected keys in checkpoint: {unexpected_keys[:5]}...")  # Show first 5
     else:
         raise ValueError("Invalid fusion model checkpoint format")
     
@@ -232,13 +264,34 @@ def run(
         webcam = False
         screenshot = False
 
-    # Dataloader (fusion images only)
-    dataset = LoadFusionImages(source, img_size=imgsz, stride=stride, auto=True)
-    bs = 1
+    # Dataloader - handle video or images
+    if is_video:
+        # Video input: use RGB video and optional IR video
+        # If ir_source is provided, use actual IR video; otherwise simulate IR from RGB (grayscale)
+        dataset = LoadFusionVideo(rgb_path=source, ir_path=ir_source, img_size=imgsz, stride=stride, auto=True, vid_stride=vid_stride)
+        bs = 1
+    else:
+        # Image directory input (rgb/ and ir/ subdirectories)
+        dataset = LoadFusionImages(source, img_size=imgsz, stride=stride, auto=True)
+        bs = 1
 
     # Run inference
-    model.warmup(imgsz=(1, 3, *imgsz))  # warmup
+    # Warmup model (optional, for better performance on first inference)
+    if hasattr(model, 'warmup'):
+        model.warmup(imgsz=(1, 3, *imgsz))
+    else:
+        # Simple warmup: do a dummy forward pass
+        with torch.no_grad():
+            dummy_rgb = torch.zeros(1, 3, imgsz[0], imgsz[1], device=device, dtype=torch.half if half else torch.float)
+            dummy_ir = torch.zeros(1, 3, imgsz[0], imgsz[1], device=device, dtype=torch.half if half else torch.float)
+            _ = model(dummy_rgb, dummy_ir)
+    
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
+    
+    # Video writers for video output (will be initialized after first frame)
+    vid_writer = None  # RGB video writer
+    vid_writer_ir = None  # IR video writer (if IR video provided)
+    
     for rgb_path, rgb_im, ir_im, rgb_im0, ir_im0, s in dataset:
         with dt[0]:
             rgb_im = torch.from_numpy(rgb_im).to(device)
@@ -255,6 +308,12 @@ def run(
         with dt[1]:
             visualize = increment_path(save_dir / Path(rgb_path).stem, mkdir=True) if visualize else False
             pred = model(rgb_im, ir_im)  # Dual-input forward pass
+        
+        # Debug: Check raw predictions before NMS (first frame only)
+        if seen == 1:
+            raw_conf = pred[0][:, 4].max().item() if len(pred[0]) > 0 else 0.0
+            LOGGER.info(f"Raw prediction max confidence (before NMS): {raw_conf:.4f}, num detections: {len(pred[0])}")
+        
         # NMS
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
@@ -276,68 +335,152 @@ def run(
                     writer.writeheader()
                 writer.writerow(data)
 
+        # Initialize video writers after first frame
+        if is_video and save_img:
+            if vid_writer is None:
+                fps = dataset.fps if hasattr(dataset, 'fps') and dataset.fps > 0 else 30.0
+                
+                # RGB video writer
+                rgb_w, rgb_h = rgb_im0.shape[1], rgb_im0.shape[0]
+                rgb_vid_path = save_dir / (Path(source).stem + "_rgb_detected.mp4")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                vid_writer = cv2.VideoWriter(str(rgb_vid_path), fourcc, fps, (rgb_w, rgb_h))
+                if not vid_writer.isOpened():
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    vid_writer = cv2.VideoWriter(str(rgb_vid_path), fourcc, fps, (rgb_w, rgb_h))
+                LOGGER.info(f"RGB video writer initialized: {rgb_vid_path} ({rgb_w}x{rgb_h} @ {fps:.2f} FPS)")
+                
+                # IR video writer (if IR video is provided)
+                if hasattr(dataset, 'has_ir_video') and dataset.has_ir_video:
+                    ir_w, ir_h = ir_im0.shape[1], ir_im0.shape[0]
+                    ir_vid_path = save_dir / (Path(ir_source).stem + "_ir_detected.mp4" if ir_source else Path(source).stem + "_ir_detected.mp4")
+                    fourcc_ir = cv2.VideoWriter_fourcc(*'mp4v')
+                    vid_writer_ir = cv2.VideoWriter(str(ir_vid_path), fourcc_ir, fps, (ir_w, ir_h))
+                    if not vid_writer_ir.isOpened():
+                        fourcc_ir = cv2.VideoWriter_fourcc(*'XVID')
+                        vid_writer_ir = cv2.VideoWriter(str(ir_vid_path), fourcc_ir, fps, (ir_w, ir_h))
+                    LOGGER.info(f"IR video writer initialized: {ir_vid_path} ({ir_w}x{ir_h} @ {fps:.2f} FPS)")
+                else:
+                    vid_writer_ir = None
+        
         # Process predictions
         for i, det in enumerate(pred):  # per image
             seen += 1
-            p, rgb_im0_copy, frame = rgb_path, rgb_im0.copy(), dataset.count - 1
+            p, rgb_im0_copy, ir_im0_copy = rgb_path, rgb_im0.copy(), ir_im0.copy()
+            frame = seen - 1
 
             p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # im.jpg
-            txt_path = str(save_dir / "labels" / p.stem) + ".txt"
+            if is_video:
+                save_path_rgb = str(save_dir / Path(source).stem) + f"_frame_{seen:06d}.jpg"  # For video frames
+                save_path_ir = str(save_dir / (Path(ir_source).stem if ir_source else Path(source).stem)) + f"_ir_frame_{seen:06d}.jpg"
+                txt_path = str(save_dir / "labels" / Path(source).stem) + f"_frame_{seen:06d}.txt"
+            else:
+                save_path_rgb = str(save_dir / p.name)  # im.jpg
+                save_path_ir = str(save_dir / p.stem) + "_ir.jpg"
+                txt_path = str(save_dir / "labels" / p.stem) + ".txt"
             s += "{:g}x{:g} ".format(*rgb_im.shape[2:])  # print string
-            gn = torch.tensor(rgb_im0_copy.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-            imc = rgb_im0_copy.copy() if save_crop else rgb_im0_copy  # for save_crop
-            annotator = Annotator(rgb_im0_copy, line_width=line_thickness, example=str(names))
+            
+            # Get preprocessing info from dataset if available
+            rgb_ratio_pad = getattr(dataset, 'rgb_ratio_pad', None)
+            ir_ratio_pad = getattr(dataset, 'ir_ratio_pad', None)
+            # Use full shape like detect.py does (scale_boxes only uses first 2 dims anyway)
+            rgb_im0_shape = rgb_im0_copy.shape
+            ir_im0_shape = ir_im0_copy.shape
+            
+            # Create annotators for both RGB and IR
+            annotator_rgb = Annotator(rgb_im0_copy, line_width=line_thickness, example=str(names))
+            annotator_ir = Annotator(ir_im0_copy, line_width=line_thickness, example=str(names))
+            
             if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(rgb_im.shape[2:], det[:, :4], rgb_im0_copy.shape).round()
+                # Transform predictions back to RGB original resolution
+                # Use same approach as detect.py - let scale_boxes calculate transformation automatically
+                # Convert tensor shapes to tuples for compatibility
+                rgb_im_shape = tuple(rgb_im.shape[2:]) if hasattr(rgb_im, 'shape') else rgb_im.shape[2:]
+                ir_im_shape = tuple(ir_im.shape[2:]) if hasattr(ir_im, 'shape') else ir_im.shape[2:]
+                
+                det_rgb = det.clone()
+                det_rgb[:, :4] = scale_boxes(rgb_im_shape, det_rgb[:, :4], rgb_im0_shape).round()
+                
+                # Transform predictions back to IR original resolution
+                det_ir = det.clone()
+                det_ir[:, :4] = scale_boxes(ir_im_shape, det_ir[:, :4], ir_im0_shape).round()
 
                 # Print results
                 for c in det[:, 5].unique():
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                # Write results
-                for *xyxy, conf, cls in reversed(det):
+                # Draw boxes on RGB image
+                gn_rgb = torch.tensor(rgb_im0_copy.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+                for *xyxy, conf, cls in reversed(det_rgb):
                     c = int(cls)  # integer class
-                    label = names[c] if hide_conf else f"{names[c]}"
-                    confidence = float(conf)
-                    confidence_str = f"{confidence:.2f}"
+                    label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
+                    annotator_rgb.box_label(xyxy, label, color=colors(c, True))
+                
+                # Draw boxes on IR image
+                gn_ir = torch.tensor(ir_im0_copy.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+                for *xyxy, conf, cls in reversed(det_ir):
+                    c = int(cls)  # integer class
+                    label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
+                    annotator_ir.box_label(xyxy, label, color=colors(c, True))
 
-                    if save_csv:
-                        write_to_csv(p.name, label, confidence_str)
-
-                    if save_txt:  # Write to file
+                # Write results (using RGB coordinates for text file)
+                if save_txt:
+                    for *xyxy, conf, cls in reversed(det_rgb):
+                        c = int(cls)
                         if save_format == 0:
                             coords = (
-                                (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
+                                (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn_rgb).view(-1).tolist()
                             )  # normalized xywh
                         else:
-                            coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()  # xyxy
+                            coords = (torch.tensor(xyxy).view(1, 4) / gn_rgb).view(-1).tolist()  # xyxy
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)  # label format
-                        with open(f"{txt_path}.txt", "a") as f:
+                        txt_file = txt_path if is_video else f"{txt_path}.txt"
+                        with open(txt_file, "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
+                
+                # Write CSV
+                if save_csv:
+                    for *xyxy, conf, cls in reversed(det_rgb):
+                        c = int(cls)
+                        label = names[c]
+                        confidence_str = f"{conf:.2f}"
+                        write_to_csv(p.name, label, confidence_str)
 
-                    if save_img or save_crop or view_img:  # Add bbox to image
-                        c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
-                        annotator.box_label(xyxy, label, color=colors(c, True))
-                    if save_crop:
-                        save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
-
+            # Get annotated images
+            rgb_im0_copy = annotator_rgb.result()
+            ir_im0_copy = annotator_ir.result()
+            
             # Stream results
-            rgb_im0_copy = annotator.result()
             if view_img:
-                if platform.system() == "Linux" and p not in windows:
-                    windows.append(p)
-                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
-                    cv2.resizeWindow(str(p), rgb_im0_copy.shape[1], rgb_im0_copy.shape[0])
-                cv2.imshow(str(p), rgb_im0_copy)
-                cv2.waitKey(1)  # 1 millisecond
+                window_name_rgb = f"{str(p)}_RGB" if is_video else f"{str(p)}_RGB"
+                window_name_ir = f"{str(p)}_IR" if is_video else f"{str(p)}_IR"
+                
+                if platform.system() == "Linux":
+                    if window_name_rgb not in windows:
+                        windows.append(window_name_rgb)
+                        cv2.namedWindow(window_name_rgb, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                        cv2.resizeWindow(window_name_rgb, rgb_im0_copy.shape[1], rgb_im0_copy.shape[0])
+                    if window_name_ir not in windows:
+                        windows.append(window_name_ir)
+                        cv2.namedWindow(window_name_ir, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                        cv2.resizeWindow(window_name_ir, ir_im0_copy.shape[1], ir_im0_copy.shape[0])
+                
+                cv2.imshow(window_name_rgb, rgb_im0_copy)
+                cv2.imshow(window_name_ir, ir_im0_copy)
+                if cv2.waitKey(1 if is_video else 0) & 0xFF == ord('q'):  # q to quit
+                    break
 
-            # Save results (image with detections)
+            # Save results (videos or images)
             if save_img:
-                cv2.imwrite(save_path, rgb_im0_copy)
+                if is_video:
+                    if vid_writer is not None:
+                        vid_writer.write(rgb_im0_copy)
+                    if vid_writer_ir is not None:
+                        vid_writer_ir.write(ir_im0_copy)
+                else:
+                    cv2.imwrite(save_path_rgb, rgb_im0_copy)
+                    cv2.imwrite(save_path_ir, ir_im0_copy)
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
@@ -345,8 +488,21 @@ def run(
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
     LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
+    
+    # Release video writers
+    if vid_writer is not None:
+        vid_writer.release()
+    if vid_writer_ir is not None:
+        vid_writer_ir.release()
+    
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
+        if is_video and save_img:
+            rgb_vid_name = Path(source).stem + "_rgb_detected.mp4"
+            s += f"\nRGB video saved to {save_dir / rgb_vid_name}"
+            if vid_writer_ir is not None:
+                ir_vid_name = (Path(ir_source).stem if ir_source else Path(source).stem) + "_ir_detected.mp4"
+                s += f"\nIR video saved to {save_dir / ir_vid_name}"
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
@@ -398,7 +554,8 @@ def parse_opt():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s.pt", help="model path or triton URL")
-    parser.add_argument("--source", type=str, default=ROOT / "data/images", help="file/dir/URL/glob/screen/0(webcam)")
+    parser.add_argument("--source", type=str, default=ROOT / "data/images", help="file/dir/URL/glob/screen/0(webcam) or RGB video")
+    parser.add_argument("--ir-source", type=str, default=None, help="(optional) IR video file path. If provided, uses actual IR video instead of simulating from RGB")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="(optional) dataset.yaml path")
     parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
     parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
