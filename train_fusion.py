@@ -532,11 +532,10 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (rgb_imgs, ir_imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (combined_imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            rgb_imgs = rgb_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-            ir_imgs = ir_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            combined_imgs = combined_imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
             targets = targets.to(device)
             
             # Debug: Check targets on first batch
@@ -562,11 +561,10 @@ def train(hyp, opt, device, callbacks):
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs  # size
-                sf = sz / max(rgb_imgs.shape[2:])  # scale factor
+                sf = sz / max(combined_imgs.shape[2:])  # scale factor
                 if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in rgb_imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    rgb_imgs = nn.functional.interpolate(rgb_imgs, size=ns, mode="bilinear", align_corners=False)
-                    ir_imgs = nn.functional.interpolate(ir_imgs, size=ns, mode="bilinear", align_corners=False)
+                    ns = [math.ceil(x * sf / gs) * gs for x in combined_imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    combined_imgs = nn.functional.interpolate(combined_imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
             # Use torch.amp.autocast for PyTorch >= 1.10.0, otherwise use torch.cuda.amp.autocast
@@ -575,7 +573,7 @@ def train(hyp, opt, device, callbacks):
             else:
                 autocast_context = torch.cuda.amp.autocast(amp)  # PyTorch < 1.10.0 uses positional argument
             with autocast_context:
-                pred = model(rgb_imgs, ir_imgs)  # forward with dual inputs
+                pred = model(combined_imgs)  # forward with combined input (B, 6, H, W)
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
@@ -602,11 +600,11 @@ def train(hyp, opt, device, callbacks):
                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5)
-                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], rgb_imgs.shape[-1])
+                    % (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], combined_imgs.shape[-1])
                 )
                 # Extract RGB paths from (rgb_path, ir_path) tuples for plotting
                 rgb_paths = [p[0] if isinstance(p, (tuple, list)) else p for p in paths]
-                callbacks.run("on_train_batch_end", model, ni, rgb_imgs, targets, rgb_paths, list(mloss))
+                callbacks.run("on_train_batch_end", model, ni, combined_imgs, targets, rgb_paths, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
@@ -630,11 +628,15 @@ def train(hyp, opt, device, callbacks):
                     original_augment = dataset.augment
                     dataset.augment = False
                     
-                    # Load sample from dataset
-                    rgb_img_tensor, ir_img_tensor, labels_tensor, paths, _ = dataset[dataset_idx]
+                    # Load sample from dataset (now returns combined tensor)
+                    combined_img_tensor, labels_tensor, paths, _ = dataset[dataset_idx]
                     
                     # Restore augmentation setting
                     dataset.augment = original_augment
+                    
+                    # Split combined tensor into RGB and IR for visualization
+                    rgb_img_tensor = combined_img_tensor[:3, :, :]  # First 3 channels: RGB
+                    ir_img_tensor = combined_img_tensor[3:, :, :]   # Last 3 channels: IR
                     
                     # Convert labels from tensor to numpy
                     labels_np = labels_tensor.numpy()

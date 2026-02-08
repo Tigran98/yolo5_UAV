@@ -278,13 +278,12 @@ def run(
     # Run inference
     # Warmup model (optional, for better performance on first inference)
     if hasattr(model, 'warmup'):
-        model.warmup(imgsz=(1, 3, *imgsz))
+        model.warmup(imgsz=(1, 6, *imgsz))  # Combined input: 6 channels (RGB + IR)
     else:
         # Simple warmup: do a dummy forward pass
         with torch.no_grad():
-            dummy_rgb = torch.zeros(1, 3, imgsz[0], imgsz[1], device=device, dtype=torch.half if half else torch.float)
-            dummy_ir = torch.zeros(1, 3, imgsz[0], imgsz[1], device=device, dtype=torch.half if half else torch.float)
-            _ = model(dummy_rgb, dummy_ir)
+            dummy_combined = torch.zeros(1, 6, imgsz[0], imgsz[1], device=device, dtype=torch.half if half else torch.float)
+            _ = model(dummy_combined)  # Single combined input
     
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     
@@ -292,22 +291,18 @@ def run(
     vid_writer = None  # RGB video writer
     vid_writer_ir = None  # IR video writer (if IR video provided)
     
-    for rgb_path, rgb_im, ir_im, rgb_im0, ir_im0, s in dataset:
+    for rgb_path, combined_im, rgb_im0, ir_im0, s in dataset:
         with dt[0]:
-            rgb_im = torch.from_numpy(rgb_im).to(device)
-            ir_im = torch.from_numpy(ir_im).to(device)
-            rgb_im = rgb_im.half() if half else rgb_im.float()
-            ir_im = ir_im.half() if half else ir_im.float()
-            rgb_im /= 255  # 0 - 255 to 0.0 - 1.0
-            ir_im /= 255  # 0 - 255 to 0.0 - 1.0
-            if len(rgb_im.shape) == 3:
-                rgb_im = rgb_im[None]  # expand for batch dim
-                ir_im = ir_im[None]
+            combined_im = torch.from_numpy(combined_im).to(device)
+            combined_im = combined_im.half() if half else combined_im.float()
+            combined_im /= 255  # 0 - 255 to 0.0 - 1.0
+            if len(combined_im.shape) == 3:
+                combined_im = combined_im[None]  # expand for batch dim
 
         # Inference
         with dt[1]:
             visualize = increment_path(save_dir / Path(rgb_path).stem, mkdir=True) if visualize else False
-            pred = model(rgb_im, ir_im)  # Dual-input forward pass
+            pred = model(combined_im)  # Single combined input forward pass (B, 6, H, W)
         
         # Debug: Check raw predictions before NMS (first frame only)
         if seen == 1:
@@ -378,7 +373,7 @@ def run(
                 save_path_rgb = str(save_dir / p.name)  # im.jpg
                 save_path_ir = str(save_dir / p.stem) + "_ir.jpg"
                 txt_path = str(save_dir / "labels" / p.stem) + ".txt"
-            s += "{:g}x{:g} ".format(*rgb_im.shape[2:])  # print string
+            s += "{:g}x{:g} ".format(*combined_im.shape[2:])  # print string
             
             # Get preprocessing info from dataset if available
             rgb_ratio_pad = getattr(dataset, 'rgb_ratio_pad', None)
@@ -395,15 +390,14 @@ def run(
                 # Transform predictions back to RGB original resolution
                 # Use same approach as detect.py - let scale_boxes calculate transformation automatically
                 # Convert tensor shapes to tuples for compatibility
-                rgb_im_shape = tuple(rgb_im.shape[2:]) if hasattr(rgb_im, 'shape') else rgb_im.shape[2:]
-                ir_im_shape = tuple(ir_im.shape[2:]) if hasattr(ir_im, 'shape') else ir_im.shape[2:]
+                combined_im_shape = tuple(combined_im.shape[2:]) if hasattr(combined_im, 'shape') else combined_im.shape[2:]
                 
                 det_rgb = det.clone()
-                det_rgb[:, :4] = scale_boxes(rgb_im_shape, det_rgb[:, :4], rgb_im0_shape).round()
+                det_rgb[:, :4] = scale_boxes(combined_im_shape, det_rgb[:, :4], rgb_im0_shape).round()
                 
                 # Transform predictions back to IR original resolution
                 det_ir = det.clone()
-                det_ir[:, :4] = scale_boxes(ir_im_shape, det_ir[:, :4], ir_im0_shape).round()
+                det_ir[:, :4] = scale_boxes(combined_im_shape, det_ir[:, :4], ir_im0_shape).round()
 
                 # Print results
                 for c in det[:, 5].unique():

@@ -326,22 +326,19 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run("on_val_start")
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (rgb_imgs, ir_imgs, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, (combined_imgs, targets, paths, shapes) in enumerate(pbar):
         callbacks.run("on_val_batch_start")
         with dt[0]:
             if cuda:
-                rgb_imgs = rgb_imgs.to(device, non_blocking=True)
-                ir_imgs = ir_imgs.to(device, non_blocking=True)
+                combined_imgs = combined_imgs.to(device, non_blocking=True)
                 targets = targets.to(device)
-            rgb_imgs = rgb_imgs.half() if half else rgb_imgs.float()  # uint8 to fp16/32
-            ir_imgs = ir_imgs.half() if half else ir_imgs.float()  # uint8 to fp16/32
-            rgb_imgs /= 255  # 0 - 255 to 0.0 - 1.0
-            ir_imgs /= 255  # 0 - 255 to 0.0 - 1.0
-            nb, _, height, width = rgb_imgs.shape  # batch size, channels, height, width
+            combined_imgs = combined_imgs.half() if half else combined_imgs.float()  # uint8 to fp16/32
+            combined_imgs /= 255  # 0 - 255 to 0.0 - 1.0
+            nb, _, height, width = combined_imgs.shape  # batch size, channels (6), height, width
 
         # Inference
         with dt[1]:
-            preds, train_out = model(rgb_imgs, ir_imgs) if compute_loss else (model(rgb_imgs, ir_imgs), None)
+            preds, train_out = model(combined_imgs) if compute_loss else (model(combined_imgs), None)
 
         # Loss
         if compute_loss:
@@ -376,12 +373,12 @@ def run(
             if single_cls:
                 pred[:, 5] = 0
             predn = pred.clone()
-            scale_boxes(rgb_imgs[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+            scale_boxes(combined_imgs[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
             # Evaluate
             if nl:
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(rgb_imgs[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                scale_boxes(combined_imgs[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
@@ -394,16 +391,19 @@ def run(
                 save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
             if save_json:
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            callbacks.run("on_val_image_end", pred, predn, path, names, rgb_imgs[si])
+            callbacks.run("on_val_image_end", pred, predn, path, names, combined_imgs[si])
 
         # Plot images
         if plots and batch_i < 3:
+            # Split combined images for visualization
+            rgb_imgs = combined_imgs[:, :3, :, :]  # First 3 channels: RGB
+            ir_imgs = combined_imgs[:, 3:, :, :]   # Last 3 channels: IR
             plot_images(rgb_imgs, targets, paths, save_dir / f"val_batch{batch_i}_labels.jpg", names)  # labels
             plot_images(rgb_imgs, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred.jpg", names)  # pred
             plot_images(ir_imgs, targets, paths, save_dir / f"val_batch{batch_i}_labels_ir.jpg", names)  # labels
             plot_images(ir_imgs, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred_ir.jpg", names)  # pred
 
-        callbacks.run("on_val_batch_end", batch_i, rgb_imgs, targets, paths, shapes, preds)
+        callbacks.run("on_val_batch_end", batch_i, combined_imgs, targets, paths, shapes, preds)
 
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
@@ -427,7 +427,7 @@ def run(
     # Print speeds
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
     if not training:
-        shape = (batch_size, 3, imgsz, imgsz)
+        shape = (batch_size, 6, imgsz, imgsz)  # Combined input: 6 channels (RGB + IR)
         LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}" % t)
 
     # Plots

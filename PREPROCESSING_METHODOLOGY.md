@@ -77,21 +77,38 @@ After translation, the RGB drone position matches the IR position exactly, enabl
 
 ## 4. Visual Comparison
 
-### 4.1 Before: Standard Letterbox (Misaligned)
+### 4.1 Before vs After Alignment
 
-![Before Alignment](docs/preprocessing_figures/alignment_BEFORE.png)
+![Before/After Alignment](docs/preprocessing_figures/alignment_before_after.png)
 
-### 4.2 After: RGB-to-IR Alignment (Unified)
-
-![After Alignment](docs/preprocessing_figures/alignment_AFTER.png)
-
-### 4.3 Misalignment Overlay
+### 4.2 Misalignment Overlay
 
 ![Alignment Overlay](docs/preprocessing_figures/alignment_overlay.png)
 
-### 4.4 Coordinate Transformation
+### 4.3 Coordinate Transformation
 
 ![Math Diagram](docs/preprocessing_figures/alignment_math_diagram.png)
+
+### 4.4 Sample Visualizations
+
+**Sample 1:**
+
+![Alignment Visualization Sample 1](docs/preprocessing_figures/alignment_sample_1_20190925_101846_1_1_0.png)
+
+**Sample 2:**
+
+![Alignment Visualization Sample 2](docs/preprocessing_figures/alignment_sample_2_20190925_101846_1_1_1.png)
+
+| Panel | Description |
+|-------|-------------|
+| Row 1, Left | Original RGB with ground truth |
+| Row 1, Middle-Left | Original IR with ground truth |
+| Row 1, Middle-Right | RGB after letterbox (red marker) |
+| Row 1, Right | IR after letterbox (cyan marker) |
+| Row 2, Left | Misalignment overlay (~47px offset) |
+| Row 2, Middle | RGB after alignment (green marker) |
+| Row 2, Middle-Right | IR resized (green marker) |
+| Row 2, Right | Transformation details |
 
 ### 4.5 Preprocessed Dataset
 

@@ -225,9 +225,14 @@ class LoadFusionImages:
         ir_im = ir_im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         ir_im = np.ascontiguousarray(ir_im)
         
+        # Combine RGB and IR into single tensor (6 channels: RGB + IR)
+        # Shape: (6, H, W) = (3 RGB channels + 3 IR channels, height, width)
+        combined_im = np.concatenate([rgb_im, ir_im], axis=0)  # Concatenate along channel dimension
+        combined_im = np.ascontiguousarray(combined_im)
+        
         s = f"image {self.count}/{self.nf} {rgb_path}: "
         
-        return rgb_path, rgb_im, ir_im, rgb_im0, ir_im0, s
+        return rgb_path, combined_im, rgb_im0, ir_im0, s
     
     def __len__(self):
         """Return number of image pairs."""
@@ -373,9 +378,14 @@ class LoadFusionVideo:
         ir_im = ir_im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         ir_im = np.ascontiguousarray(ir_im)
         
+        # Combine RGB and IR into single tensor (6 channels: RGB + IR)
+        # Shape: (6, H, W) = (3 RGB channels + 3 IR channels, height, width)
+        combined_im = np.concatenate([rgb_im, ir_im], axis=0)  # Concatenate along channel dimension
+        combined_im = np.ascontiguousarray(combined_im)
+        
         s = f"video frame {self.frame}/{self.frames} {self.rgb_path}: "
         
-        return self.rgb_path, rgb_im, ir_im, rgb_im0, ir_im0, s
+        return self.rgb_path, combined_im, rgb_im0, ir_im0, s
     
     def __len__(self):
         """Return number of frames."""
@@ -803,13 +813,18 @@ class DualModalDataset(LoadImagesAndLabels):
         ir_img = ir_img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         ir_img = np.ascontiguousarray(ir_img)
         
+        # Combine RGB and IR into single tensor (6 channels: RGB + IR)
+        # Shape: (6, H, W) = (3 RGB channels + 3 IR channels, height, width)
+        combined_img = np.concatenate([rgb_img, ir_img], axis=0)  # Concatenate along channel dimension
+        combined_img = np.ascontiguousarray(combined_img)
+        
         paths = (self.rgb_files[mapped_index], self.ir_files[mapped_index])
-        return torch.from_numpy(rgb_img), torch.from_numpy(ir_img), labels_out, paths, shapes
+        return torch.from_numpy(combined_img), labels_out, paths, shapes
     
     @staticmethod
     def collate_fn(batch):
-        """Collate function for dual-input batches."""
-        rgb_imgs, ir_imgs, labels, paths, shapes = zip(*batch)
+        """Collate function for combined-input batches (6-channel: RGB+IR)."""
+        combined_imgs, labels, paths, shapes = zip(*batch)
         # Set image indices for all labels - match parent class behavior exactly
         for i, lb in enumerate(labels):
             if lb.shape[0] > 0:  # Only set image index if labels exist
@@ -817,44 +832,47 @@ class DualModalDataset(LoadImagesAndLabels):
         # Concatenate labels - match parent class behavior
         # Parent class does: torch.cat(label, 0) which handles empty tensors
         labels_cat = torch.cat(labels, 0)
-        return torch.stack(rgb_imgs, 0), torch.stack(ir_imgs, 0), labels_cat, paths, shapes
+        return torch.stack(combined_imgs, 0), labels_cat, paths, shapes
     
     @staticmethod
     def collate_fn4(batch):
-        """Collate function for dual-input batches with 4x mosaic."""
-        rgb_imgs, ir_imgs, labels, paths, shapes = zip(*batch)
+        """Collate function for combined-input batches with 4x mosaic."""
+        combined_imgs, labels, paths, shapes = zip(*batch)
         n = len(shapes) // 4
-        rgb_imgs4, ir_imgs4, labels4, paths4, shapes4 = [], [], [], [], []
+        combined_imgs4, labels4, paths4, shapes4 = [], [], [], []
         ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
         wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
         s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
         for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
             i *= 4
             if random.random() < 0.5:
-                im = rgb_imgs[i].numpy()  # HWC
-                ir = ir_imgs[i].numpy()
-                h, w = im.shape[1:]
+                combined = combined_imgs[i].numpy()  # CHW format: (6, H, W)
+                # Split combined image into RGB and IR for resizing
+                rgb = combined[:3, :, :]  # First 3 channels: RGB
+                ir = combined[3:, :, :]   # Last 3 channels: IR
+                h, w = rgb.shape[1:]
                 labels4.append(torch.zeros(0, 6))
                 s_ = s[0]
-                im, ir = im.copy(), ir.copy()
+                rgb, ir = rgb.copy(), ir.copy()
                 if random.random() < 0.5:
-                    im = cv2.resize(im, (int(w * s_), int(h * s_)), interpolation=cv2.INTER_LINEAR)
-                    ir = cv2.resize(ir, (int(w * s_), int(h * s_)), interpolation=cv2.INTER_LINEAR)
+                    # Resize RGB and IR separately, then recombine
+                    rgb_resized = cv2.resize(rgb.transpose(1, 2, 0), (int(w * s_), int(h * s_)), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1)
+                    ir_resized = cv2.resize(ir.transpose(1, 2, 0), (int(w * s_), int(h * s_)), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1)
                 else:
-                    im = cv2.resize(im, (int(w / s_), int(h / s_)), interpolation=cv2.INTER_LINEAR)
-                    ir = cv2.resize(ir, (int(w / s_), int(h / s_)), interpolation=cv2.INTER_LINEAR)
-                top, left = int(random.uniform(0, h - im.shape[1])), int(random.uniform(0, w - im.shape[2]))
-                im = im[:, top : top + im.shape[1], left : left + im.shape[2]]
-                ir = ir[:, top : top + ir.shape[1], left : left + ir.shape[2]]
-                rgb_imgs4.append(torch.from_numpy(im))
-                ir_imgs4.append(torch.from_numpy(ir))
+                    rgb_resized = cv2.resize(rgb.transpose(1, 2, 0), (int(w / s_), int(h / s_)), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1)
+                    ir_resized = cv2.resize(ir.transpose(1, 2, 0), (int(w / s_), int(h / s_)), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1)
+                # Recombine RGB and IR
+                combined_resized = np.concatenate([rgb_resized, ir_resized], axis=0)
+                h_new, w_new = rgb_resized.shape[1:]
+                top, left = int(random.uniform(0, h_new - combined_resized.shape[1])), int(random.uniform(0, w_new - combined_resized.shape[2]))
+                combined_cropped = combined_resized[:, top : top + combined_resized.shape[1], left : left + combined_resized.shape[2]]
+                combined_imgs4.append(torch.from_numpy(combined_cropped))
             else:
                 labels4.append(labels[i])  # no augmentation needed
-                rgb_imgs4.append(rgb_imgs[i])
-                ir_imgs4.append(ir_imgs[i])
+                combined_imgs4.append(combined_imgs[i])
         for i, label in enumerate(labels4):
             label[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(rgb_imgs4, 0), torch.stack(ir_imgs4, 0), torch.cat(labels4, 0), paths4, shapes4
+        return torch.stack(combined_imgs4, 0), torch.cat(labels4, 0), paths4, shapes4
 
 
 def create_fusion_dataloader(

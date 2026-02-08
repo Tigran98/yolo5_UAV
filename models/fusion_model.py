@@ -266,13 +266,13 @@ class YOLOv5FusionModel(BaseModel):
             )
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
     
-    def forward(self, x_rgb, x_ir, augment=False, profile=False, visualize=False):
+    def forward(self, x_rgb, x_ir=None, augment=False, profile=False, visualize=False):
         """
-        Forward pass with dual inputs.
+        Forward pass with single combined input (for FPGA deployment) or dual inputs (backward compatibility).
         
         Args:
-            x_rgb: RGB input (B, 3, H, W)
-            x_ir: IR input (B, 3, H, W)
+            x_rgb: Combined input (B, 6, H, W) if x_ir is None, or RGB input (B, 3, H, W) if x_ir is provided
+            x_ir: IR input (B, 3, H, W) - optional, for backward compatibility. If None, x_rgb is treated as combined (B, 6, H, W)
             augment: Augmented inference
             profile: Profile performance
             visualize: Visualize features
@@ -280,6 +280,20 @@ class YOLOv5FusionModel(BaseModel):
         Returns:
             Detection outputs
         """
+        # Handle single combined input (B, 6, H, W) for FPGA deployment
+        if x_ir is None:
+            # x_rgb is actually the combined input (B, 6, H, W)
+            if x_rgb.shape[1] == 6:
+                # Split combined input into RGB and IR
+                x_rgb_split = x_rgb[:, :3, :, :]  # First 3 channels: RGB
+                x_ir_split = x_rgb[:, 3:, :, :]   # Last 3 channels: IR
+                if augment:
+                    return self._forward_augment(x_rgb_split, x_ir_split)
+                return self._forward_once(x_rgb_split, x_ir_split, profile, visualize)
+            else:
+                raise ValueError(f"Expected combined input with 6 channels (B, 6, H, W), got shape {x_rgb.shape}")
+        
+        # Backward compatibility: dual inputs (B, 3, H, W) each
         if augment:
             return self._forward_augment(x_rgb, x_ir)
         return self._forward_once(x_rgb, x_ir, profile, visualize)
