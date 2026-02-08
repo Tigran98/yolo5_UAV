@@ -391,7 +391,9 @@ def run(
                 save_one_txt(predn, save_conf, shape, file=save_dir / "labels" / f"{path.stem}.txt")
             if save_json:
                 save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            callbacks.run("on_val_image_end", pred, predn, path, names, combined_imgs[si])
+            # Split combined image to RGB for callback (plot_images expects 3-channel images)
+            rgb_img_for_callback = combined_imgs[si][:3, :, :]  # First 3 channels: RGB
+            callbacks.run("on_val_image_end", pred, predn, path, names, rgb_img_for_callback)
 
         # Plot images
         if plots and batch_i < 3:
@@ -403,7 +405,9 @@ def run(
             plot_images(ir_imgs, targets, paths, save_dir / f"val_batch{batch_i}_labels_ir.jpg", names)  # labels
             plot_images(ir_imgs, output_to_target(preds), paths, save_dir / f"val_batch{batch_i}_pred_ir.jpg", names)  # pred
 
-        callbacks.run("on_val_batch_end", batch_i, combined_imgs, targets, paths, shapes, preds)
+        # Split combined images to RGB for callback (plot_images expects 3-channel images)
+        rgb_imgs_for_callback = combined_imgs[:, :3, :, :]  # First 3 channels: RGB
+        callbacks.run("on_val_batch_end", batch_i, rgb_imgs_for_callback, targets, paths, shapes, preds)
 
     # Compute metrics
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy

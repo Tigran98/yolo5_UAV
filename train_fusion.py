@@ -604,7 +604,9 @@ def train(hyp, opt, device, callbacks):
                 )
                 # Extract RGB paths from (rgb_path, ir_path) tuples for plotting
                 rgb_paths = [p[0] if isinstance(p, (tuple, list)) else p for p in paths]
-                callbacks.run("on_train_batch_end", model, ni, combined_imgs, targets, rgb_paths, list(mloss))
+                # Split combined images to RGB for callbacks (plot_images expects 3-channel images)
+                rgb_imgs_for_plot = combined_imgs[:, :3, :, :]  # First 3 channels: RGB
+                callbacks.run("on_train_batch_end", model, ni, rgb_imgs_for_plot, targets, rgb_paths, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
