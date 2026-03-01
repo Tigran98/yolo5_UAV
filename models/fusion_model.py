@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from models.common import FeatureFusion
+from models.common import FUSION_OPERATORS, FeatureFusion
 from models.yolo import BaseModel, Detect, parse_model
 from utils.autoanchor import check_anchor_order
 from utils.general import LOGGER
@@ -22,7 +22,7 @@ class YOLOv5FusionModel(BaseModel):
     Features are fused at P3, P4, P5 before the PANet neck.
     """
 
-    def __init__(self, cfg="yolov5n_fusion.yaml", ch=3, nc=None, anchors=None):
+    def __init__(self, cfg="yolov5n_fusion.yaml", ch=3, nc=None, anchors=None, fusion_type=None):
         """
         Initialize the fusion model.
         
@@ -31,6 +31,7 @@ class YOLOv5FusionModel(BaseModel):
             ch: Input channels (3 for RGB/IR)
             nc: Number of classes
             anchors: Anchor boxes for detection head
+            fusion_type: Override fusion operator type (concat, add, mul, se)
         """
         super().__init__()
         
@@ -50,6 +51,9 @@ class YOLOv5FusionModel(BaseModel):
         if anchors:
             LOGGER.info(f"Overriding model.yaml anchors with anchors={anchors}")
             self.yaml["anchors"] = round(anchors)
+        if fusion_type:
+            LOGGER.info(f"Overriding model.yaml fusion_type={self.yaml.get('fusion_type', 'concat')} with fusion_type={fusion_type}")
+            self.yaml["fusion_type"] = fusion_type
         
         # Build RGB backbone
         LOGGER.info("Building RGB backbone...")
@@ -80,8 +84,14 @@ class YOLOv5FusionModel(BaseModel):
                     LOGGER.info(f"Fusion point {i}: actual channels = {actual_ch}")
         
         # Build fusion modules with actual channel counts
+        fusion_type = self.yaml.get('fusion_type', 'concat')
+        FusionClass = FUSION_OPERATORS.get(fusion_type)
+        if FusionClass is None:
+            raise ValueError(f"Unknown fusion_type '{fusion_type}'. "
+                             f"Available: {list(FUSION_OPERATORS.keys())}")
+        LOGGER.info(f"Fusion operator: {fusion_type} ({FusionClass.__name__})")
         self.fusions = nn.ModuleList([
-            FeatureFusion(c) for c in self.fusion_channels
+            FusionClass(c) for c in self.fusion_channels
         ])
         
         # Build head using parse_model with fused feature channels

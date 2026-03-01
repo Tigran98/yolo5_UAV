@@ -13,6 +13,7 @@ anchors:
   - [116, 90, 156, 198, 373, 326]  # P5/32
 
 # Fusion configuration
+fusion_type: concat  # Fusion operator: concat | add | mul | se
 fusion_indices: [4, 6, 9]  # Layer indices for P3, P4, P5 fusion
 fusion_channels: [64, 128, 256]  # Channel counts at fusion points (before width_multiple)
 # After width_multiple (0.25): P3=16ch, P4=32ch, P5=64ch

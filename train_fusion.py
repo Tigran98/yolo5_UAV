@@ -235,7 +235,7 @@ def train(hyp, opt, device, callbacks):
         - Datasets: https://github.com/ultralytics/yolov5/tree/master/data
         - Tutorial: https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
     """
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = (
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze, fusion_type = (
         Path(opt.save_dir),
         opt.epochs,
         opt.batch_size,
@@ -249,6 +249,7 @@ def train(hyp, opt, device, callbacks):
         opt.nosave,
         opt.workers,
         opt.freeze,
+        getattr(opt, 'fusion_type', 'concat'),
     )
     callbacks.run("on_pretrain_routine_start")
 
@@ -314,7 +315,7 @@ def train(hyp, opt, device, callbacks):
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model = FusionModel(cfg or 'models/yolov5n_fusion.yaml', ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+        model = FusionModel(cfg or 'models/yolov5n_fusion.yaml', ch=3, nc=nc, anchors=hyp.get("anchors"), fusion_type=fusion_type).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
         
@@ -368,7 +369,7 @@ def train(hyp, opt, device, callbacks):
         model.load_state_dict(model_dict, strict=False)  # load
         LOGGER.info(f"Transferred {loaded_count} parameters from {weights} to fusion model")  # report
     else:
-        model = FusionModel(cfg or 'models/yolov5n_fusion.yaml', ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+        model = FusionModel(cfg or 'models/yolov5n_fusion.yaml', ch=3, nc=nc, anchors=hyp.get("anchors"), fusion_type=fusion_type).to(device)
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -694,6 +695,7 @@ def train(hyp, opt, device, callbacks):
                     "updates": ema.updates,
                     "optimizer": optimizer.state_dict(),
                     "opt": vars(opt),
+                    "yaml": model.yaml,
                     "git": GIT_INFO,  # {remote, branch, commit} if a git repo
                     "date": datetime.now().isoformat(),
                 }
@@ -821,6 +823,11 @@ def parse_opt(known=False):
     parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
     parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
 
+    # Fusion ablation
+    parser.add_argument("--fusion-type", type=str, default="concat",
+                        choices=["concat", "add", "mul", "se"],
+                        help="Fusion operator type: concat (default), add, mul, se")
+
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 
@@ -874,6 +881,9 @@ def main(opt, callbacks=Callbacks()):
             opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
         if opt.name == "cfg":
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
+        fusion_type = getattr(opt, 'fusion_type', 'concat')
+        if fusion_type != 'concat':
+            opt.name = f"{opt.name}_fusion_{fusion_type}"
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
     # DDP mode

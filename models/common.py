@@ -1124,30 +1124,63 @@ class Classify(nn.Module):
 
 
 class FeatureFusion(nn.Module):
-    """Fuses RGB and IR features using concatenation + 1x1 convolution."""
+    """Fuses RGB and IR features using concatenation + 1x1 convolution (default)."""
 
     def __init__(self, c1):
-        """
-        Initializes feature fusion module.
-        
-        Args:
-            c1: Input channels from each modality (output channels will be same)
-        """
         super().__init__()
-        # Concatenate features and reduce back to original channels with 1x1 conv
         self.fuse = Conv(c1 * 2, c1, k=1, s=1)
-    
+
     def forward(self, x_rgb, x_ir):
-        """
-        Fuses RGB and IR features.
-        
-        Args:
-            x_rgb: RGB features (B, C, H, W)
-            x_ir: IR features (B, C, H, W)
-            
-        Returns:
-            Fused features (B, C, H, W)
-        """
-        # Concatenate along channel dimension and apply 1x1 conv
         x = torch.cat([x_rgb, x_ir], dim=1)
         return self.fuse(x)
+
+
+class FeatureFusionAdd(nn.Module):
+    """Fuses RGB and IR features via element-wise addition (zero extra params)."""
+
+    def __init__(self, c1):
+        super().__init__()
+
+    def forward(self, x_rgb, x_ir):
+        return x_rgb + x_ir
+
+
+class FeatureFusionMul(nn.Module):
+    """Fuses RGB and IR features via element-wise multiplication (zero extra params)."""
+
+    def __init__(self, c1):
+        super().__init__()
+
+    def forward(self, x_rgb, x_ir):
+        return x_rgb * x_ir
+
+
+class FeatureFusionSE(nn.Module):
+    """Fuses RGB and IR features via concatenation + squeeze-and-excitation channel attention + 1x1 conv."""
+
+    def __init__(self, c1, reduction=4):
+        super().__init__()
+        c2 = c1 * 2
+        mid = max(c2 // reduction, 8)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(c2, mid),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, c2),
+            nn.Sigmoid(),
+        )
+        self.proj = Conv(c2, c1, k=1, s=1)
+
+    def forward(self, x_rgb, x_ir):
+        x = torch.cat([x_rgb, x_ir], dim=1)
+        w = self.se(x).unsqueeze(-1).unsqueeze(-1)
+        return self.proj(x * w)
+
+
+FUSION_OPERATORS = {
+    'concat': FeatureFusion,
+    'add': FeatureFusionAdd,
+    'mul': FeatureFusionMul,
+    'se': FeatureFusionSE,
+}
